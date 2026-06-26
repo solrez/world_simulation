@@ -3,8 +3,8 @@ import { getProvider } from './providers/provider.js';
 // All model calls go through the active provider (OpenAI by default, swappable
 // to local/Claude via VITE_AI_PROVIDER). callLLM keeps the old callOpenAI
 // signature so the three call sites below stay unchanged.
-function callLLM(systemPrompt, userPrompt, temperature = 0.9, maxTokens = 500, label) {
-  return getProvider().complete({ system: systemPrompt, user: userPrompt, temperature, maxTokens, label });
+function callLLM(systemPrompt, userPrompt, temperature = 0.9, maxTokens = 500, label, signal) {
+  return getProvider().complete({ system: systemPrompt, user: userPrompt, temperature, maxTokens, label, signal });
 }
 
 // ── helpers ──
@@ -105,7 +105,7 @@ Skills: ${skills}. Goals: ${goals}.`;
 
 // ── MAIN DECISION — the character's brain ──
 
-export async function generateAction(person, allPeople, worldState) {
+export async function generateAction(person, allPeople, worldState, signal) {
   const world = describeWorld(person, allPeople, worldState);
 
   const systemPrompt = `You ARE ${person.name}. You are a real person in a small primitive settlement. You must decide what to do RIGHT NOW based on your needs, personality, memories, relationships, and what's happening around you.
@@ -170,12 +170,12 @@ JSON response:
   "update_goals": [{"action": "add/drop", "goal": "description"}] or null
 }`;
 
-  return callLLM(systemPrompt, userPrompt, 0.9, 400, 'action');
+  return callLLM(systemPrompt, userPrompt, 0.9, 400, 'action', signal);
 }
 
 // ── DIALOGUE ──
 
-export async function generateGroupDialogue(speaker, otherParticipants, allPeople, context, history) {
+export async function generateGroupDialogue(speaker, otherParticipants, allPeople, context, history, signal) {
   const otherNames = otherParticipants.map(p => p.name);
   const pastConvos = getPastConversations(speaker, otherNames, 2);
 
@@ -235,7 +235,7 @@ JSON:
   "wants_to_continue": true or false
 }`;
 
-  const result = await callLLM(systemPrompt, userPrompt, 0.95, 400, 'dialogue');
+  const result = await callLLM(systemPrompt, userPrompt, 0.95, 400, 'dialogue', signal);
   if (!result) return null;
   history.push({ speaker: speaker.name, text: result.dialogue, thought: result.internal_thought });
   if (history.length > 30) history.splice(0, history.length - 30);

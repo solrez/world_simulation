@@ -10,6 +10,13 @@ function saveDataPlugin() {
   return {
     name: 'save-data',
     configureServer(server) {
+      // GET /api/ping — liveness probe so the browser sim can detect when the
+      // dev server has been stopped (Ctrl+C) and halt itself.
+      server.middlewares.use('/api/ping', (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ ok: true }));
+      });
+
       // POST /api/save-conversation — append one conversation to the log
       server.middlewares.use('/api/save-conversation', (req, res) => {
         if (req.method !== 'POST') { res.statusCode = 405; res.end(); return; }

@@ -14,11 +14,12 @@ export class OpenAIProvider {
 
   // schema is accepted for interface parity; OpenAI's json_object mode does not
   // consume it directly, so it remains advisory (documented by the prompt).
-  async complete({ system, user, temperature = 0.9, maxTokens = 500 }) {
+  async complete({ system, user, temperature = 0.9, maxTokens = 500, signal }) {
     if (!this.apiKey) return null;
     try {
       const resp = await fetch(this.url, {
         method: 'POST',
+        signal,
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.apiKey}` },
         body: JSON.stringify({
           model: this.model,

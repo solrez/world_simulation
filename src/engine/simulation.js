@@ -1683,7 +1683,7 @@ export function findConversationGroup(people) {
   return null;
 }
 
-export async function runConversation(gameRef, participantIndices, onUpdate) {
+export async function runConversation(gameRef, participantIndices, onUpdate, signal) {
   const people = gameRef.current.people;
   const participants = participantIndices.map(i => people[i]);
   const convoId = gameRef.current.nextConvoId;
@@ -1720,7 +1720,8 @@ export async function runConversation(gameRef, participantIndices, onUpdate) {
     }${speaker.partner ? ` ${speaker.name} is with ${speaker.partner}.` : ''}${
       speaker.hunger > 60 ? ` ${speaker.name} is hungry.` : ''}${speaker.tiredness > 60 ? ` Tired.` : ''}`;
 
-    const result = await generateGroupDialogue(speaker, others, cs.people, context, history);
+    if (signal?.aborted) break;
+    const result = await generateGroupDialogue(speaker, others, cs.people, context, history, signal);
     if (!result) { await new Promise(r => setTimeout(r, 800)); continue; }
 
     conversation.lines.push({
@@ -1854,7 +1855,7 @@ function pickNextSpeaker(participants, lastSpeakerIdx, speakCount, lines) {
   return pick ? pick.i : (lastSpeakerIdx + 1) % participants.length;
 }
 
-export async function runAIAction(gameRef, personIdx) {
+export async function runAIAction(gameRef, personIdx, signal) {
   const person = gameRef.current.people[personIdx];
   // this person's LLM turn is being consumed — clear the flag and start the
   // escalation cooldown so one event doesn't spam calls.
@@ -1871,7 +1872,7 @@ export async function runAIAction(gameRef, personIdx) {
     hour: cs.hour, minute: cs.minute,
     season: cs.season, villageFood: cs.villageFood,
     wildlife: cs.wildlife, buildings: cs.buildings,
-  });
+  }, signal);
   if (!result) return;
 
   person.mood = result.mood || person.mood;

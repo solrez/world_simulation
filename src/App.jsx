@@ -16,6 +16,8 @@ function App() {
   const [activePower, setActivePower] = useState(null);
   const [following, setFollowing] = useState(null);
   const [matchmakeFirst, setMatchmakeFirst] = useState(null);
+  // true once the dev server stops responding (e.g. Ctrl+C) — halts the sim
+  const [serverDown, setServerDown] = useState(false);
 
   const gameRef = useRef(initialState);
   const rendererRef = useRef(null);
@@ -25,6 +27,26 @@ function App() {
   useEffect(() => {
     gameRef.current = { ...gameRef.current, speed };
   }, [speed]);
+
+  // heartbeat: if the dev server stops answering (Ctrl+C), halt the sim so the
+  // browser tab doesn't keep running and calling the AI on its own.
+  useEffect(() => {
+    let misses = 0;
+    const beat = async () => {
+      try {
+        const r = await fetch('/api/ping', { cache: 'no-store' });
+        if (!r.ok) throw new Error('bad status');
+        misses = 0;
+        setServerDown(false);
+      } catch {
+        // two consecutive misses to avoid halting on a transient hiccup
+        if (++misses >= 2) setServerDown(true);
+      }
+    };
+    beat();
+    const id = setInterval(beat, 4000);
+    return () => clearInterval(id);
+  }, []);
 
   // pixi init
   useEffect(() => {
@@ -46,6 +68,7 @@ function App() {
 
   // simulation tick
   useEffect(() => {
+    if (serverDown) return;
     const interval = setInterval(() => {
       if (paused) return;
       const next = simulateTick(gameRef.current);
@@ -71,13 +94,14 @@ function App() {
       }
     }, 400 / speed);
     return () => clearInterval(interval);
-  }, [speed, paused, following]);
+  }, [speed, paused, following, serverDown]);
 
   // conversations
   useEffect(() => {
-    if (paused) return;
+    if (paused || serverDown) return;
+    const ac = new AbortController();
     const tryConvo = async () => {
-      if (activeConvoCount.current >= 2) return;
+      if (ac.signal.aborted || activeConvoCount.current >= 2) return;
       const group = findConversationGroup(gameRef.current.people);
       if (!group) return;
       activeConvoCount.current++;
@@ -88,18 +112,20 @@ function App() {
             rendererRef.current.updateCharacters(gameRef.current.people);
             rendererRef.current.updateBubbles(gameRef.current.activeConversations, gameRef.current.people);
           }
-        });
+        }, ac.signal);
       } finally { activeConvoCount.current--; }
     };
     const convoInterval = setInterval(tryConvo, 4000 / speed);
-    return () => clearInterval(convoInterval);
-  }, [speed, paused]);
+    return () => { ac.abort(); clearInterval(convoInterval); };
+  }, [speed, paused, serverDown]);
 
   // AI actions — the escalation gate flags who is "interesting" (pendingLLM);
   // we spend an LLM call only on them. When nobody is flagged, zero calls.
   useEffect(() => {
-    if (paused) return;
+    if (paused || serverDown) return;
+    const ac = new AbortController();
     const actionInterval = setInterval(async () => {
+      if (ac.signal.aborted) return;
       const candidates = gameRef.current.people.filter(p =>
         p.pendingLLM && p.alive !== false && !p.conversationId && !p.sleeping && !p.eating &&
         p.lifeStage !== 'baby'
@@ -108,11 +134,11 @@ function App() {
       // oldest-flagged first (they've waited longest)
       const person = candidates[0];
       const idx = gameRef.current.people.indexOf(person);
-      await runAIAction(gameRef, idx);
-      setGame({ ...gameRef.current });
+      await runAIAction(gameRef, idx, ac.signal);
+      if (!ac.signal.aborted) setGame({ ...gameRef.current });
     }, 2000 / speed); // can poll more often now that most rounds no-op
-    return () => clearInterval(actionInterval);
-  }, [speed, paused]);
+    return () => { ac.abort(); clearInterval(actionInterval); };
+  }, [speed, paused, serverDown]);
 
   // god power handler
   const handleGodPower = (powerId, targetIdx) => {
@@ -197,6 +223,11 @@ function App() {
       <div className="main-area">
         <div className="map-container">
           <div className="pixi-container" ref={pixiRef} />
+          {serverDown && (
+            <div className="server-down-banner">
+              ⏸ Dev server stopped — simulation halted. Restart <code>npm run dev</code> and reload.
+            </div>
+          )}
           {activePower && (
             <div className="god-power-indicator">
               {activePower === 'matchmake'
