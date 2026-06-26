@@ -1,4 +1,4 @@
-import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, SKILLS, AMBIENT_EVENTS, BUILD_REQUIREMENTS, BUILD_PHASES, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE } from '../utils/constants.js';
+import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, SKILLS, AMBIENT_EVENTS, BUILD_REQUIREMENTS, BUILD_PHASES, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE } from '../utils/constants.js';
 import { buildWalkableGrid, findPath, nearestWalkable } from './pathfinding.js';
 import { generateGroupDialogue, generateAction } from './ai.js';
 
@@ -71,7 +71,7 @@ export function downloadFullWorldState(gameState) {
     })),
     stats: gameState.stats,
     day: gameState.day, season: gameState.season,
-    villageFood: gameState.villageFood,
+    larder: gameState.larder,
     buildings: gameState.buildings,
     events: gameState.events.slice(-50),
   };
@@ -211,6 +211,7 @@ function initPerson(config, index, startX, startY) {
     home: null,
     pregnant: false,
     pregnancyTimer: 0,
+    pregnancyDay: 0,
     children: [],
     parents: [],
     // memory
@@ -236,13 +237,18 @@ function initPerson(config, index, startX, startY) {
     sickTimer: 0,
     // favorite location
     favoriteLocation: null,
-    // inventory
-    inventory: { food: 5, wood: 0, stone: 0, thatch: 0 },
+    // inventory (materials) + typed food larder
+    inventory: { wood: 0, stone: 0, thatch: 0 },
+    larder: { meat: 0, fish: 0, berries: 3, crops: 0 },
+    lastEaten: null,
     // crafted tools that boost gathering yields, plus in-progress craft state
     tools: {},
     craftTool: null,
     craftProgress: 0,
     foodGathered: 0,
+    // Q-learning: learned action values + per-action stats
+    qValues: {},
+    actionStats: {},
     // social
     flirting: null,
     // awe — sense of higher power
@@ -294,7 +300,9 @@ export function createSimulation() {
     day: 1, hour: 8, minute: 0,
     timeOfDay: 'morning', weather: 'clear',
     season: 'spring',
-    villageFood: 50,
+    // shared village larder (typed) + resource-patch depletion state
+    larder: { meat: 8, fish: 12, berries: 20, crops: 6 },
+    patches: { 'Berry Bush': 1, 'Fishing Spot': 1, 'Meadow': 1 },
     stats: { totalBirths: 0, totalDeaths: 0, totalPartnerships: 0, totalConversations: 0 },
     events: [], conversations: [], activeConversations: [],
     nextConvoId: 1, tick: 0, speed: 1, paused: false,
@@ -493,6 +501,36 @@ function goToPerson(person, target) {
   person.targetY = target.y + (Math.random() - 0.5) * 1;
 }
 
+// Which productive action to do, ε-greedy over learned Q-values. This is the
+// local adaptation between LLM calls: agents lean into what's worked, but still
+// explore (Q_EPSILON) so they discover hunting/building pay off.
+const WORK_ACTIONS = ['fish', 'forage', 'hunt', 'chop_wood'];
+function pickWorkAction(person, state) {
+  if (Math.random() < Q_EPSILON) return WORK_ACTIONS[Math.floor(Math.random() * WORK_ACTIONS.length)];
+  let best = WORK_ACTIONS[0], bestV = -Infinity;
+  for (const a of WORK_ACTIONS) {
+    const v = qValue(person, state, a) + Math.random() * 0.01; // tiny tiebreak jitter
+    if (v > bestV) { bestV = v; best = a; }
+  }
+  return best;
+}
+function startWorkAction(person, action, state) {
+  const map = {
+    fish: ['Fishing Spot', 'gathering'],
+    forage: ['Berry Bush', 'gathering'],
+    chop_wood: ['Grove', 'chopping'],
+  };
+  if (action === 'hunt') {
+    const prey = (state.wildlife || []).find(w => w.alive);
+    if (prey) { person.targetX = prey.x; person.targetY = prey.y; person.activity = 'hunting'; setGoal(person, 'hunt', prey.type, 80); return; }
+    action = 'forage'; // nothing to hunt → fall back
+  }
+  const [loc, act] = map[action] || map.forage;
+  goToLocation(person, loc);
+  person.activity = act;
+  setGoal(person, 'work', loc, 40);
+}
+
 function pickTarget(person, people, state) {
   const schedule = SCHEDULE[state.timeOfDay] || 'free';
 
@@ -508,13 +546,9 @@ function pickTarget(person, people, state) {
       return;
 
     case 'work':
-      // go gather resources, explore, or build
-      if (Math.random() < 0.5) {
-        const workLocs = ['Berry Bush', 'Fishing Spot', 'Grove', 'Well'];
-        const loc = weightedLocationPick(person, workLocs);
-        goToLocation(person, loc);
-        person.activity = 'working';
-        setGoal(person, 'work', loc, 40);
+      // pick the work that's been paying off (learned), with some exploration
+      if (Math.random() < 0.6) {
+        startWorkAction(person, pickWorkAction(person, state), state);
       } else {
         pickExploreTarget(person);
       }
@@ -736,7 +770,9 @@ function updateNeeds(person, timeOfDay, weather) {
 
   // tiredness — awake ~16 hrs before exhausted
   if (person.sleeping) {
-    person.tiredness = clamp(person.tiredness - 0.2, 0, 100);  // ~6 hrs to fully rest
+    // sleeping in your own home rests you faster (a real payoff for building)
+    const atHome = person.home && Math.abs(person.x - person.home.x) < 2 && Math.abs(person.y - person.home.y) < 2;
+    person.tiredness = clamp(person.tiredness - (atHome ? 0.3 : 0.2), 0, 100);
     if (person.tiredness <= 3) {
       person.sleeping = false;
       person.activity = 'wandering';
@@ -824,7 +860,20 @@ function escalationGate(person, people, state) {
     }
 
     // 4. the village is running out of food — a real "do I go help?" choice
-    if (state.villageFood < 20 && (person.inventory.food || 0) < 5 && Math.random() < 0.1) {
+    if (totalFood(state) < 20 && totalFood(person) < 5 && Math.random() < 0.1) {
+      return { verdict: 'ESCALATE' };
+    }
+
+    // 5. homeless adult, especially with winter coming — building is now a real
+    //    survival choice (and the Q-table has learned it pays off)
+    if (!person.home && person.lifeStage === LIFE_STAGES.ADULT && !person.buildProject &&
+        (state.season === 'fall' || state.season === 'winter') && Math.random() < 0.05) {
+      return { verdict: 'ESCALATE' };
+    }
+
+    // 6. hungry and hunting has paid off lately → consider a hunt
+    if (person.hunger >= GATE.HUNGER_BAND[0] && qValue(person, state, 'hunt') > qValue(person, state, 'forage') &&
+        Math.random() < 0.1) {
       return { verdict: 'ESCALATE' };
     }
   }
@@ -845,17 +894,13 @@ function applyReflex(person, reflex, state) {
       break;
     }
     case 'eat': {
-      if (person.inventory.food > 0) {
-        person.inventory.food--;
-        person.hunger = clamp(person.hunger - 25, 0, 100);
+      const relief = eatFood(person) || takeFromLarder(state, person);
+      if (relief > 0) {
         person.eating = true; person.activity = 'eating';
         setEmote(person, 'eat', 30); setGoal(person, 'eat', null, 30);
-      } else if (state.villageFood > 5) {
-        state.villageFood -= 2;
-        person.hunger = clamp(person.hunger - 20, 0, 100);
-        person.eating = true; person.activity = 'eating';
-        setEmote(person, 'eat', 30); setGoal(person, 'eat', null, 30);
+        rewardAction(person, 'forage', relief / 20, state); // satisfying a need pays off
       } else {
+        // nothing on hand or in the larder — go produce some
         const foodLocs = Object.values(LOCATIONS).filter(l => l.type === 'food');
         const loc = weightedLocationPick(person, foodLocs.map(l => l.name));
         if (loc) { goToLocation(person, loc); person.activity = 'gathering'; setGoal(person, 'work', loc, 100); }
@@ -875,15 +920,18 @@ function applyReflex(person, reflex, state) {
 // a "decision" — it's an automatic kind act. Runs every tick regardless of the
 // gate, preserving the kindness-memory / affection mechanic.
 function processFoodSharing(person, people, state) {
-  if (person.sleeping || person.eating || (person.inventory.food || 0) <= 3) return;
+  if (person.sleeping || person.eating || totalFood(person) <= 3) return;
   for (const other of people) {
     if (other.name === person.name || other.alive === false || other.hunger < 50) continue;
     if (distBetween(person, other) > 4) continue;
     const rel = person.relationships[other.name];
     if (!rel) continue;
     if (person.partner === other.name || rel.affection > 55 || rel.attraction > 60) {
-      person.inventory.food -= 2;
-      other.inventory.food += 2;
+      // give two units of whatever the giver has most of
+      const give = ['meat', 'fish', 'crops', 'berries'].find(t => (person.larder?.[t] || 0) > 0);
+      if (!give) break;
+      person.larder[give] = Math.max(0, person.larder[give] - 2);
+      addFood(other, give, 2);
       other.hunger = clamp(other.hunger - 15, 0, 100);
       setEmote(person, 'heart', 15);
       rel.affection = clamp(rel.affection + 2, 0, 100);
@@ -927,7 +975,7 @@ function updateJealousy(person, people) {
 
 // ── Life events ──
 
-function processLifeEvents(person, people, state) {
+function processLifeEvents(person, people, state, dayRolled) {
   if (person.partner && person.gender === 'female' && !person.pregnant && person.lifeStage === LIFE_STAGES.ADULT) {
     const partner = people.find(p => p.name === person.partner);
     if (partner) {
@@ -942,9 +990,11 @@ function processLifeEvents(person, people, state) {
         state.stats.totalPartnerships++;
         setEmote(person, 'heart', 50); setEmote(partner, 'heart', 50);
       }
-      if (rel && rel.stage === RELATIONSHIP_STAGES.PARTNERED && state.day > 3 && Math.random() < 0.005) {
+      // conception is a once-per-day roll, so partners don't breed every tick
+      if (dayRolled && rel && rel.stage === RELATIONSHIP_STAGES.PARTNERED && state.day > 3 && Math.random() < CONCEPTION_CHANCE) {
         person.pregnant = true;
-        person.pregnancyTimer = 100;
+        person.pregnancyDay = state.day;            // conceived on this day
+        person.pregnancyTimer = Math.max(1, Math.round(TICKS_PER_DAY * GESTATION_DAYS));
         addMemory(person, `Expecting a child with ${partner.name}!`, 'life', state.day);
         addMemory(partner, `${person.name} is expecting our child!`, 'life', state.day);
         setEmote(person, 'sparkle', 40);
@@ -953,6 +1003,7 @@ function processLifeEvents(person, people, state) {
     }
   }
 
+  // gestation counts down every tick; the belly bump (renderer) shows throughout
   if (person.pregnant) {
     person.pregnancyTimer--;
     if (person.pregnancyTimer <= 0) {
@@ -970,8 +1021,9 @@ function processLifeEvents(person, people, state) {
     }
   }
 
-  if (state.tick % 600 === 0 && state.tick > 0) {
-    person.age++;
+  // age in step with the calendar: YEARS_PER_DAY years per game-day
+  if (dayRolled) {
+    person.age += YEARS_PER_DAY;
     person.lifeStage = getLifeStage(person.age);
   }
 
@@ -987,12 +1039,13 @@ function processLifeEvents(person, people, state) {
     if (hasEnough && distBetween(person, { x: bp.site.x, y: bp.site.y }) < 3) {
       // at build site with materials — advance construction (proximity to the
       // site is what matters, not the named location under their feet)
-      bp.progress = (bp.progress || 0) + 1 + (person.skills.building || 0) * 0.02;
+      bp.progress = (bp.progress || 0) + 2 + (person.skills.building || 0) * 0.04;
       person.activity = 'building';
-      person.skills.building = Math.min(100, (person.skills.building || 0) + 0.05);
+      gainSkill(person, 'building', 0.05);
+      rewardAction(person, 'build', 0.4, state); // steady progress is rewarding
 
       const totalNeeded = mn.wood + mn.stone + mn.thatch;
-      const progressTarget = totalNeeded * 3; // takes ~3 work-ticks per material unit
+      const progressTarget = totalNeeded * 1.5; // faster so houses actually finish
 
       if (bp.progress >= progressTarget) {
         // construction complete!
@@ -1014,7 +1067,9 @@ function processLifeEvents(person, people, state) {
         state.buildings.push(home);
 
         setEmote(person, 'sparkle', 60);
-        addMemory(person, `Finished building a ${bp.type}${partner ? ` with ${partner.name}` : ''}!`, 'life', state.day);
+        gainSkill(person, 'building', 3);
+        rewardAction(person, 'build', 10, state); // big payoff: Q learns building is worth it
+        addMemory(person, `Finished building a ${bp.type}${partner ? ` with ${partner.name}` : ''}!`, 'achievement', state.day, { location: person.currentLocation });
         state.events.push({ day: state.day, hour: state.hour, participants: [person.name, partner?.name].filter(Boolean), summary: `🏠 ${person.name} completed a ${bp.type}!`, type: 'building' });
         person.buildProject = null;
       } else {
@@ -1118,7 +1173,7 @@ export function simulateTick(state) {
     updateNeeds(person, next.timeOfDay, next.weather);
     updateMoodFromNeeds(person);
     updateJealousy(person, alivePeople);
-    updateSkills(person);
+    updateSkills(person, next);
     if (dayRolled) decayMemories(person, next);
     processBreakups(person, alivePeople, next);
     processIllness(person, next);
@@ -1129,7 +1184,7 @@ export function simulateTick(state) {
     for (const otherName of Object.keys(person.relationships))
       updateRelationshipStage(person, otherName, alivePeople);
 
-    processLifeEvents(person, next.people, next);
+    processLifeEvents(person, next.people, next, dayRolled);
     processDeath(person, next);
 
     // children learn from nearby parents
@@ -1223,7 +1278,7 @@ export function simulateTick(state) {
 
   // season and resources
   updateSeason(next);
-  processResources(next);
+  processResources(next, dayRolled);
 
   // wildlife
   updateWildlife(next);
@@ -1248,28 +1303,138 @@ function chooseToolToCraft(person) {
   return options[0].tool;
 }
 
-function updateSkills(person) {
+// Skill grows from SUCCESS, not from time spent standing around. A productive
+// yield is what teaches you — so a focused hunter/forager genuinely outpaces a
+// chatterbox, and skills diverge into specialists.
+const SKILL_GAIN_ON_SUCCESS = 0.15;
+function gainSkill(person, skill, amount = SKILL_GAIN_ON_SUCCESS) {
+  person.skills[skill] = Math.min(100, (person.skills[skill] || 0) + amount);
+}
+
+// ── Typed food economy ──
+function emptyLarder() { return { meat: 0, fish: 0, berries: 0, crops: 0 }; }
+function addFood(person, type, amount) {
+  if (!person.larder) person.larder = emptyLarder();
+  person.larder[type] = (person.larder[type] || 0) + amount;
+}
+function totalFood(holder) {
+  const l = holder.larder; if (!l) return 0;
+  return (l.meat || 0) + (l.fish || 0) + (l.berries || 0) + (l.crops || 0);
+}
+// Eat the most-abundant food on hand; returns the hunger restored, or 0 if none.
+// Eating a *different* type than last time gives a small variety mood bonus.
+function eatFood(person) {
+  const l = person.larder; if (!l) return 0;
+  let best = null, max = 0;
+  for (const t of Object.keys(FOOD_TYPES)) if ((l[t] || 0) > max) { max = l[t]; best = t; }
+  if (!best) return 0;
+  l[best]--;
+  const restore = FOOD_TYPES[best].hunger;
+  person.hunger = clamp(person.hunger - restore, 0, 100);
+  if (person.lastEaten && person.lastEaten !== best && person.mood === 'neutral') person.mood = 'content';
+  person.lastEaten = best;
+  return restore;
+}
+
+// Eat from the shared village larder (most abundant type). Returns hunger restored.
+function takeFromLarder(state, person) {
+  const l = state.larder; if (!l) return 0;
+  let best = null, max = 0;
+  for (const t of Object.keys(FOOD_TYPES)) if ((l[t] || 0) > max) { max = l[t]; best = t; }
+  if (!best) return 0;
+  l[best]--;
+  const restore = FOOD_TYPES[best].hunger * 0.85; // village fare slightly less filling
+  person.hunger = clamp(person.hunger - restore, 0, 100);
+  person.lastEaten = best;
+  return restore;
+}
+
+// ── Resource patches (depletion + regrowth) ──
+function patchYield(state, name) {
+  if (!state.patches) state.patches = {};
+  const v = state.patches[name];
+  return v == null ? 1 : v;
+}
+function depletePatch(state, name) {
+  if (!state.patches) state.patches = {};
+  const cur = state.patches[name] == null ? 1 : state.patches[name];
+  state.patches[name] = Math.max(PATCH_MIN, cur - PATCH_DEPLETE);
+}
+function regrowPatches(state) {
+  if (!state.patches) return;
+  for (const k of Object.keys(state.patches)) {
+    state.patches[k] = Math.min(1, state.patches[k] + PATCH_REGROW_PER_DAY);
+  }
+}
+
+// ── Q-learning-lite: agents learn which actions pay off, per season ──
+// Coarse context keeps the table tiny so it learns fast and stays inspectable.
+function qContext(person, state) {
+  const need = person.hunger > 60 ? 'hungry' : person.tiredness > 60 ? 'tired' : 'ok';
+  return `${state.season}|${need}`;
+}
+// Incremental Q update: estimate moves ALPHA of the way toward observed reward.
+function rewardAction(person, action, reward, state) {
+  if (!person.qValues) person.qValues = {};
+  if (!person.actionStats) person.actionStats = {};
+  const key = `${qContext(person, state)}:${action}`;
+  const q = person.qValues[key] ?? 0;
+  person.qValues[key] = q + Q_ALPHA * (reward - q);
+  const s = person.actionStats[action] || { tries: 0, total: 0 };
+  s.tries++; s.total += reward;
+  person.actionStats[action] = s;
+}
+// The skill a person is best at — their emerging identity in the village.
+function topSkill(person) {
+  let best = null, max = 8; // must be meaningfully skilled to "be" something
+  for (const [k, v] of Object.entries(person.skills || {})) if (v > max) { max = v; best = k; }
+  return best;
+}
+
+// Learned value of one action in the current context (0 if untried).
+function qValue(person, state, action) {
+  if (!person.qValues) return 0;
+  return person.qValues[`${qContext(person, state)}:${action}`] ?? 0;
+}
+
+// Top actions by learned value in the current context (for prompts/fallback).
+function qBestActions(person, state, n = 3) {
+  if (!person.qValues) return [];
+  const ctx = qContext(person, state);
+  const rows = Object.entries(person.qValues)
+    .filter(([k]) => k.startsWith(ctx + ':'))
+    .map(([k, v]) => ({ action: k.split(':')[1], value: v }))
+    .sort((a, b) => b.value - a.value);
+  return rows.slice(0, n);
+}
+
+function updateSkills(person, state) {
   const loc = person.currentLocation;
   const tools = person.tools || {};
 
-  // food gathering
+  const season = SEASON_ABUNDANCE[state.season] || { forage: 1, hunt: 1 };
+  // food gathering — skill advances only on a successful yield
   if (person.activity === 'working' || person.activity === 'gathering') {
     if (loc === 'Fishing Spot') {
-      person.skills.fishing = Math.min(100, person.skills.fishing + 0.02);
-      const chance = (0.005 + person.skills.fishing * 0.0003) * (tools.fishing_rod ? 1.6 : 1);
+      const chance = (0.015 + person.skills.fishing * 0.0005) * (tools.fishing_rod ? 1.6 : 1) * patchYield(state, 'Fishing Spot');
       if (Math.random() < chance) {
         const amount = 1 + Math.floor(person.skills.fishing / 25);
-        person.inventory.food += amount;
+        addFood(person, 'fish', amount);
         person.foodGathered += amount;
+        gainSkill(person, 'fishing');
+        depletePatch(state, 'Fishing Spot');
+        rewardAction(person, 'fish', amount, state);
         person.thought = `Caught ${amount} fish!`;
       }
     } else if (loc === 'Berry Bush') {
-      person.skills.foraging = Math.min(100, person.skills.foraging + 0.02);
-      const chance = (0.005 + person.skills.foraging * 0.0003) * (tools.forage_basket ? 1.6 : 1);
+      const chance = (0.015 + person.skills.foraging * 0.0005) * (tools.forage_basket ? 1.6 : 1) * patchYield(state, 'Berry Bush') * season.forage;
       if (Math.random() < chance) {
         const amount = 1 + Math.floor(person.skills.foraging / 25);
-        person.inventory.food += amount;
+        addFood(person, 'berries', amount);
         person.foodGathered += amount;
+        gainSkill(person, 'foraging');
+        depletePatch(state, 'Berry Bush');
+        rewardAction(person, 'forage', amount, state);
         person.thought = `Found ${amount} berries!`;
       }
     }
@@ -1277,9 +1442,10 @@ function updateSkills(person) {
 
   // chopping wood at Grove
   if ((person.activity === 'chopping' || person.activity === 'working') && loc === 'Grove') {
-    person.skills.building = Math.min(100, person.skills.building + 0.02);
-    if (Math.random() < (0.004 + person.skills.building * 0.0002) * (tools.axe ? 1.6 : 1)) {
+    if (Math.random() < (0.012 + person.skills.building * 0.0004) * (tools.axe ? 1.6 : 1)) {
       person.inventory.wood++;
+      gainSkill(person, 'building');
+      rewardAction(person, 'chop_wood', 1, state);
       person.thought = `Chopped a log! (${person.inventory.wood} total)`;
       setEmote(person, 'sparkle', 8);
     }
@@ -1287,14 +1453,15 @@ function updateSkills(person) {
 
   // crafting a tool — progresses while activity is 'crafting'; faster with skill
   if (person.activity === 'crafting' && person.craftTool) {
-    person.skills.crafting = Math.min(100, (person.skills.crafting || 0) + 0.05);
     person.craftProgress = (person.craftProgress || 0) + 1 + person.skills.crafting * 0.02;
     if (person.craftProgress >= 40) {
       person.tools = { ...(person.tools || {}), [person.craftTool]: true };
+      gainSkill(person, 'crafting', 1);
       const made = person.craftTool.replace('_', ' ');
       person.thought = `Finished crafting a ${made}!`;
       setEmote(person, 'sparkle', 12);
       addMemory(person, `Crafted a ${made}`, 'achievement', person._craftDay ?? 0, { location: person.currentLocation });
+      rewardAction(person, 'craft', 3, state);
       person.craftTool = null;
       person.craftProgress = 0;
       person.activity = 'idle';
@@ -1303,35 +1470,31 @@ function updateSkills(person) {
 
   // collecting stone at Rock Seat
   if ((person.activity === 'collecting' || person.activity === 'working') && loc === 'Rock Seat') {
-    person.skills.building = Math.min(100, person.skills.building + 0.015);
-    if (Math.random() < 0.003 + person.skills.building * 0.0002) {
+    if (Math.random() < 0.01 + person.skills.building * 0.0004) {
       person.inventory.stone++;
+      gainSkill(person, 'building');
+      rewardAction(person, 'collect_stone', 1, state);
       person.thought = `Found a good stone! (${person.inventory.stone} total)`;
     }
   }
 
   // gathering thatch at Meadow
   if ((person.activity === 'gathering' || person.activity === 'working') && loc === 'Meadow') {
-    person.skills.foraging = Math.min(100, person.skills.foraging + 0.01);
-    if (Math.random() < (0.005 + person.skills.foraging * 0.0003) * (tools.forage_basket ? 1.6 : 1)) {
+    if (Math.random() < (0.015 + person.skills.foraging * 0.0005) * (tools.forage_basket ? 1.6 : 1)) {
       person.inventory.thatch++;
+      gainSkill(person, 'foraging', 0.08);
+      rewardAction(person, 'gather_thatch', 1, state);
       person.thought = `Gathered thatch! (${person.inventory.thatch} total)`;
     }
   }
 
-  // general building skill from construction activity
-  if (person.activity === 'building') {
-    person.skills.building = Math.min(100, person.skills.building + 0.03);
-  }
-  if (person.conversationId) {
-    person.skills.storytelling = Math.min(100, person.skills.storytelling + 0.06);
-    // good storytellers boost attraction
-    if (person.skills.storytelling > 30) {
-      // subtle attraction boost to conversation partners
-      for (const [name, rel] of Object.entries(person.relationships)) {
-        if (rel.familiarity > 10 && Math.random() < 0.005) {
-          rel.attraction = Math.min(100, rel.attraction + 0.3);
-        }
+  // storytelling is now a modest, completion-based skill (handled at end of a
+  // conversation in runConversation), NOT a free +0.06/tick ride. Here we only
+  // keep the subtle attraction effect for already-skilled storytellers.
+  if (person.conversationId && person.skills.storytelling > 30) {
+    for (const [name, rel] of Object.entries(person.relationships)) {
+      if (rel.familiarity > 10 && Math.random() < 0.005) {
+        rel.attraction = Math.min(100, rel.attraction + 0.3);
       }
     }
   }
@@ -1385,11 +1548,13 @@ function processIllness(person, state) {
     return;
   }
 
-  // natural illness — more likely when hungry, tired, or in winter
+  // natural illness — more likely when hungry, tired, or in winter; a home
+  // (shelter) cuts the risk, especially in winter
   const winterMod = state.season === 'winter' ? 3 : 1;
   const exhaustionMod = person.tiredness > 70 ? 2 : 1;
   const hungerMod = person.hunger > 60 ? 2 : 1;
-  if (Math.random() < 0.00004 * winterMod * exhaustionMod * hungerMod) {
+  const shelterMod = person.home ? 0.5 : 1;
+  if (Math.random() < 0.00004 * winterMod * exhaustionMod * hungerMod * shelterMod) {
     person.sick = true;
     person.sickTimer = 200 + Math.floor(Math.random() * 200); // ~3-7 game-hours
     person.mood = 'sad';
@@ -1445,29 +1610,38 @@ function updateSeason(state) {
 
 // ── Village resources ──
 
-function processResources(state) {
-  // collect food from gatherers
-  for (const p of state.people) {
-    if (p.alive === false) continue;
-    if (p.foodGathered > 0) {
-      state.villageFood += p.foodGathered;
-      p.foodGathered = 0;
+function processResources(state, dayRolled) {
+  // gatherers periodically deposit surplus food into the shared larder
+  if (state.tick % 200 === 0) {
+    for (const p of state.people) {
+      if (p.alive === false || !p.larder) continue;
+      for (const t of Object.keys(FOOD_TYPES)) {
+        const surplus = (p.larder[t] || 0) - 4; // keep a personal reserve of 4
+        if (surplus > 0) { p.larder[t] -= surplus; state.larder[t] = (state.larder[t] || 0) + surplus; }
+      }
     }
   }
-  // village consumes food (1 per alive person per 250 ticks = ~4 game-hours)
+  // village consumes from the larder (most-abundant type) per person, ~4 game-hrs
   if (state.tick % 250 === 0) {
     const alive = state.people.filter(p => p.alive !== false).length;
-    state.villageFood = Math.max(0, state.villageFood - alive);
+    for (let i = 0; i < alive; i++) {
+      let best = null, max = 0;
+      for (const t of Object.keys(FOOD_TYPES)) if ((state.larder[t] || 0) > max) { max = state.larder[t]; best = t; }
+      if (best) state.larder[best]--;
+    }
   }
-  // season affects food
-  if (state.season === 'winter' && state.tick % 200 === 0) {
-    state.villageFood = Math.max(0, state.villageFood - 1);
+  // spoilage: a fraction of each food type rots per game-day (a smokehouse can
+  // slow this later via System 4)
+  if (dayRolled) {
+    const slow = (state.buildings || []).some(b => /smokehouse|storage|drying/i.test(b.type || '')) ? 0.5 : 1;
+    for (const t of Object.keys(FOOD_TYPES)) {
+      const rot = Math.floor((state.larder[t] || 0) * FOOD_TYPES[t].spoilPerDay * slow);
+      if (rot > 0) state.larder[t] = Math.max(0, state.larder[t] - rot);
+    }
+    regrowPatches(state);
   }
-  if (state.season === 'summer' && state.tick % 300 === 0) {
-    state.villageFood += 2;
-  }
-  // famine warning
-  if (state.villageFood <= 0) {
+  // famine: empty larder makes everyone hungrier faster
+  if (totalFood(state) <= 0) {
     for (const p of state.people) {
       if (p.alive !== false) p.hunger = Math.min(100, p.hunger + 0.5);
     }
@@ -1656,7 +1830,7 @@ function processSeasonalEvents(state) {
       p.hunger = Math.max(0, p.hunger - 20);
       p.loneliness = Math.max(0, p.loneliness - 20);
       setEmote(p, 'sparkle', 30);
-      if (event.name === 'Storytelling Night') p.skills.storytelling = Math.min(100, p.skills.storytelling + 1);
+      if (event.name === 'Storytelling Night') gainSkill(p, 'storytelling', 0.2);
       addMemory(p, `Joined the ${event.name} at the Campfire`, 'kindness', state.day, { location: 'Campfire' });
     }
     state.events.push({ day: state.day, hour: state.hour, participants: alivePeople.map(p => p.name), summary: `🎉 ${event.name}! ${event.desc}`, type: 'seasonal' });
@@ -1807,6 +1981,11 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
     p.conversationCooldown = 12 + Math.floor(Math.random() * 10);
     p.activity = 'wandering';
     p.currentGoal = null;
+    // storytelling grows only a LITTLE per conversation — far less than the
+    // productive skills, so real work (hunting/building/foraging) defines who
+    // someone becomes, not idle chatter.
+    gainSkill(p, 'storytelling', 0.08);
+    rewardAction(p, 'socialize', Math.max(0.5, p.loneliness / 40), gameRef.current);
     pickTarget(p, gameRef.current.people, gameRef.current);
 
     // store actual conversation in their personal log (capped at 20 conversations)
@@ -1870,8 +2049,10 @@ export async function runAIAction(gameRef, personIdx, signal) {
   const result = await generateAction(person, cs.people, {
     timeOfDay: cs.timeOfDay, weather: cs.weather, day: cs.day,
     hour: cs.hour, minute: cs.minute,
-    season: cs.season, villageFood: cs.villageFood,
+    season: cs.season, villageFood: totalFood(cs), larder: cs.larder,
     wildlife: cs.wildlife, buildings: cs.buildings,
+    learned: qBestActions(person, cs, 3),       // System 5: what's been paying off
+    specialty: topSkill(person),                 // specialization identity
   }, signal);
   if (!result) return;
 
@@ -1972,18 +2153,28 @@ export async function runAIAction(gameRef, personIdx, signal) {
         person.targetY = prey.y;
         person.activity = 'hunting';
         setGoal(person, 'hunt', prey.type, 80);
-        // attempt to catch if close enough
-        if (distBetween(person, prey) < 2) {
+        // attempt to catch if close enough — more reliable now so hunting is a
+        // viable strategy the Q-system can learn to value
+        if (distBetween(person, prey) < 2.5) {
           const huntSkill = person.skills?.hunting || 0;
-          const catchChance = 0.1 + huntSkill * 0.003;
+          const seasonHunt = (SEASON_ABUNDANCE[cs.season] || { hunt: 1 }).hunt;
+          const catchChance = (0.35 + huntSkill * 0.005) * seasonHunt;
           if (Math.random() < catchChance) {
             prey.alive = false;
-            person.inventory.food += prey.foodValue;
-            person.foodGathered += prey.foodValue;
-            person.skills.hunting = Math.min(100, (person.skills.hunting || 0) + 1);
+            const meat = Math.max(2, Math.round(prey.foodValue));
+            addFood(person, 'meat', meat);
+            person.foodGathered += meat;
+            gainSkill(person, 'hunting', 1);
+            rewardAction(person, 'hunt', meat, cs);
             setEmote(person, 'sparkle', 20);
-            addMemory(person, `Caught a ${prey.type}! Got ${prey.foodValue} food.`, 'achievement', cs.day, { location: person.currentLocation });
+            addMemory(person, `Caught a ${prey.type}! Got ${meat} meat.`, 'achievement', cs.day, { location: person.currentLocation });
             cs.events.push({ day: cs.day, hour: cs.hour, participants: [person.name], summary: `🏹 ${person.name} caught a ${prey.type}!`, type: 'hunt' });
+          } else if (prey.dangerous && Math.random() < 0.3) {
+            // dangerous prey can hurt you — hunting has real risk (Q learns this)
+            person.hunger = Math.min(100, person.hunger + 10);
+            setEmote(person, 'fear', 20);
+            rewardAction(person, 'hunt', -3, cs);
+            addMemory(person, `A ${prey.type} fought back while hunting!`, 'danger', cs.day, { location: person.currentLocation });
           }
         }
       } else {

@@ -42,9 +42,9 @@ function formatPlaceFeelings(person) {
 }
 
 function formatInventory(person) {
-  const inv = person.inventory || {};
   const parts = [];
-  for (const [k, v] of Object.entries(inv)) { if (v > 0) parts.push(`${v} ${k}`); }
+  for (const [k, v] of Object.entries(person.inventory || {})) { if (v > 0) parts.push(`${v} ${k}`); }
+  for (const [k, v] of Object.entries(person.larder || {})) { if (v > 0) parts.push(`${v} ${k}`); }
   return parts.join(', ') || 'nothing';
 }
 
@@ -128,12 +128,18 @@ You're being asked to decide because something INTERESTING is happening — a ch
 - Your projects and ambitions (push them forward, or let them go)
 - Sometimes just do nothing — sit, think, wander aimlessly. Real people don't optimize every minute.
 
+${worldState.specialty ? `You've become the village's go-to for ${worldState.specialty} — it's part of who you are now.` : ''}
 You can also UPDATE YOUR GOALS if they no longer make sense. Drop goals that feel wrong, add new ones based on what's happened to you.`;
+
+  const learnedStr = (worldState.learned || []).filter(l => Math.abs(l.value) > 0.3)
+    .map(l => `${l.action} (${l.value > 0 ? 'paying off' : 'disappointing'})`).join(', ');
+  const larder = worldState.larder || {};
+  const larderStr = Object.entries(larder).filter(([, v]) => v > 0).map(([k, v]) => `${v} ${k}`).join(', ') || 'bare';
 
   const userPrompt = `CURRENT SITUATION:
 Location: ${person.currentLocation || 'settlement'}.
 Time: ${worldState.timeOfDay} (${worldState.hour}:${String(worldState.minute).padStart(2,'0')}), Day ${worldState.day}, ${worldState.season}. Weather: ${worldState.weather}.
-Village food supply: ${worldState.villageFood ?? 50}.
+Village larder: ${larderStr}.${learnedStr ? `\nWHAT YOU'VE LEARNED works ${worldState.season}: ${learnedStr}.` : ''}
 
 PEOPLE:
 ${world.others || 'Nobody around.'}

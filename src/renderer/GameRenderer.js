@@ -69,6 +69,7 @@ export class GameRenderer {
     this._timeOfDay = 'morning';
     // per-entity view caches, keyed by id, for pooling (see updateCharacters)
     this._charCache = new Map();
+    this._buildCache = new Map();
     this._fontReady = false;
   }
 
@@ -404,118 +405,133 @@ export class GameRenderer {
   // ── BUILDINGS ──
 
   updateBuildings(buildings, people) {
-    if (this._buildingGfx) this.decorLayer.removeChild(this._buildingGfx);
-    const g = new Graphics();
+    const tick = this._animFrame;
 
-    // draw completed buildings
+    // collect the current set of sites (completed + under construction), keyed
+    // by tile so each persists across ticks like a pooled character.
+    const sites = [];
     if (buildings?.length) {
-      for (const b of buildings) {
-        const bx = b.x * T + T / 2, by = b.y * T + T / 2;
-        const quality = b.quality || 'basic';
-        const scale = quality === 'crude' ? 0.7 : quality === 'excellent' ? 1.2 : quality === 'good' ? 1.1 : 1;
-
-        g.ellipse(bx + 2, by + 12 * scale, 14 * scale, 5 * scale).fill({ color: 0x000000, alpha: 0.12 });
-        // foundation
-        g.roundRect(bx - 12 * scale, by - 2, 24 * scale, 16 * scale, 2).fill(quality === 'crude' ? 0x4a4030 : 0x5a5040);
-        // walls — stone for good/excellent, wood for others
-        const wallColor = (quality === 'good' || quality === 'excellent') ? 0x7a7a70 : 0x8B7355;
-        g.roundRect(bx - 11 * scale, by - 6 * scale, 22 * scale, 16 * scale, 1).fill(wallColor);
-        g.roundRect(bx - 10 * scale, by - 5 * scale, 20 * scale, 14 * scale, 1).fill(wallColor + 0x101010);
-        // roof
-        g.moveTo(bx - 14 * scale, by - 6 * scale).lineTo(bx, by - 18 * scale).lineTo(bx + 14 * scale, by - 6 * scale).fill(0xA0522D);
-        g.moveTo(bx - 13 * scale, by - 6 * scale).lineTo(bx, by - 16 * scale).lineTo(bx + 13 * scale, by - 6 * scale).fill(0xB06030);
-        // door
-        g.roundRect(bx - 3, by + 1, 6, 9 * scale, 1).fill(0x4a3020);
-        g.circle(bx + 2, by + 5, 0.8).fill(0xc0a060);
-        // window
-        g.rect(bx + 5 * scale, by - 1, 5, 5).fill(0x3060a0);
-        g.rect(bx + 5 * scale, by + 1.5, 5, 0.5).fill(0x5a4030);
-        g.rect(bx + 7.5 * scale, by - 1, 0.5, 5).fill(0x5a4030);
-        // chimney for decent+
-        if (quality !== 'crude') {
-          g.rect(bx + 6, by - 18 * scale, 4, 8).fill(0x6a5a5a);
-          if (this._timeOfDay === 'night' || this._timeOfDay === 'evening') {
-            for (let i = 0; i < 3; i++) {
-              const sy = by - 20 * scale - i * 4 + Math.sin(this._animFrame * 0.03 + i) * 2;
-              g.circle(bx + 8 + Math.sin(this._animFrame * 0.02 + i * 2) * 2, sy, 2 - i * 0.4)
-                .fill({ color: 0x888888, alpha: 0.2 - i * 0.05 });
-            }
-          }
-        }
-        // type label
-        if (b.type) {
-          const label = new Text({ text: b.type, style: new TextStyle({ fontSize: 5, fill: 0x90a080, fontFamily: 'monospace', stroke: { color: 0x000000, width: 1 } }) });
-          label.anchor.set(0.5, 0); label.x = bx; label.y = by + 14 * scale;
-          g.addChild(label);
-        }
-      }
+      for (const b of buildings) sites.push({ key: `b:${b.x},${b.y}`, b, x: b.x, y: b.y });
     }
-
-    // draw active construction sites
-    if (people) {
+    if (people?.length) {
       const seen = new Set();
       for (const p of people) {
         if (!p.buildProject || p.buildProject.phase === 'complete' || p.alive === false) continue;
         const bp = p.buildProject;
-        const key = `${bp.site.x},${bp.site.y}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        const bx = bp.site.x * T + T / 2, by = bp.site.y * T + T / 2;
-
-        if (bp.phase === 'planning') {
-          // stakes in the ground marking the site
-          for (let i = 0; i < 4; i++) {
-            const sx = bx + [-10, 10, -10, 10][i], sy = by + [-8, -8, 8, 8][i];
-            g.rect(sx - 0.5, sy - 4, 1, 8).fill(0x8a7050);
-          }
-          // rope between stakes
-          g.moveTo(bx - 10, by - 8).lineTo(bx + 10, by - 8).stroke({ color: 0x8a7050, width: 0.5, alpha: 0.5 });
-          g.moveTo(bx + 10, by - 8).lineTo(bx + 10, by + 8).stroke({ color: 0x8a7050, width: 0.5, alpha: 0.5 });
-          g.moveTo(bx + 10, by + 8).lineTo(bx - 10, by + 8).stroke({ color: 0x8a7050, width: 0.5, alpha: 0.5 });
-          g.moveTo(bx - 10, by + 8).lineTo(bx - 10, by - 8).stroke({ color: 0x8a7050, width: 0.5, alpha: 0.5 });
-        } else if (bp.phase === 'foundation') {
-          // stone/log foundation
-          g.roundRect(bx - 12, by + 4, 24, 6, 1).fill(0x5a5a50);
-          g.roundRect(bx - 10, by + 2, 20, 4, 1).fill(0x6a6a58);
-          // stacked logs nearby
-          for (let i = 0; i < 3; i++) {
-            g.roundRect(bx + 14, by - 2 + i * 3, 8, 2.5, 1).fill(0x6a5030);
-          }
-        } else if (bp.phase === 'walls') {
-          // partial walls going up
-          g.roundRect(bx - 12, by + 2, 24, 8, 1).fill(0x5a5040); // foundation
-          g.roundRect(bx - 11, by - 4, 3, 10, 1).fill(0x8B7355); // left wall
-          g.roundRect(bx + 8, by - 4, 3, 10, 1).fill(0x8B7355); // right wall
-          g.roundRect(bx - 11, by - 4, 22, 3, 1).fill(0x8B7355); // back wall
-          // scaffolding
-          g.rect(bx - 14, by - 6, 1, 16).fill(0x7a6a50);
-          g.rect(bx + 13, by - 6, 1, 16).fill(0x7a6a50);
-          g.rect(bx - 14, by - 2, 28, 1).fill(0x7a6a50);
-        } else if (bp.phase === 'roof') {
-          // walls complete, roof going on
-          g.roundRect(bx - 12, by - 2, 24, 14, 1).fill(0x5a5040);
-          g.roundRect(bx - 11, by - 6, 22, 16, 1).fill(0x8B7355);
-          // partial roof
-          g.moveTo(bx - 14, by - 6).lineTo(bx - 2, by - 14).lineTo(bx + 2, by - 14).fill(0xA0522D);
-          // thatch bundles nearby
-          for (let i = 0; i < 2; i++) {
-            g.circle(bx - 16 + i * 4, by + 6, 3).fill(0x8a9a50);
-          }
-        }
-
-        // "Under Construction" label
-        const phaseLabel = new Text({
-          text: `🏗 ${bp.type || 'building'} (${bp.phase})`,
-          style: new TextStyle({ fontSize: 5, fill: 0xc0a060, fontFamily: 'monospace', stroke: { color: 0x000000, width: 1 } }),
-        });
-        phaseLabel.anchor.set(0.5, 0); phaseLabel.x = bx; phaseLabel.y = by + 14;
-        g.addChild(phaseLabel);
+        const k = `${bp.site.x},${bp.site.y}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        sites.push({ key: `c:${k}`, bp, x: bp.site.x, y: bp.site.y });
       }
     }
 
-    this._buildingGfx = g;
-    this.decorLayer.addChild(g);
+    for (const site of sites) {
+      let view = this._buildCache.get(site.key);
+      if (!view) {
+        view = this._makeBuildView();
+        this._buildCache.set(site.key, view);
+        this.decorLayer.addChild(view.container);
+      }
+      view.seen = tick;
+      const bx = site.x * T + T / 2, by = site.y * T + T / 2;
+      view.container.x = bx; view.container.y = by;
+
+      if (site.b) {
+        const quality = site.b.quality || 'basic';
+        const sig = `done|${site.b.type}|${quality}`;
+        if (view.sig !== sig) { view.sig = sig; this._drawBuildingBody(view.body, quality); this._setBuildLabel(view, site.b.type || '', 0x90a080); }
+        this._drawChimneySmoke(view.smoke, quality, tick);
+      } else {
+        const bp = site.bp;
+        const sig = `${bp.phase}|${bp.type}`;
+        if (view.sig !== sig) { view.sig = sig; this._drawConstruction(view.body, bp.phase); this._setBuildLabel(view, `${bp.type || 'building'} (${bp.phase})`, 0xc0a060); }
+        view.smoke.clear();
+      }
+    }
+
+    // sweep finished/removed sites
+    for (const [key, view] of this._buildCache) {
+      if (view.seen !== tick) { view.container.destroy({ children: true }); this._buildCache.delete(key); }
+    }
+  }
+
+  _makeBuildView() {
+    const container = new Container();
+    const body = new Graphics();
+    const smoke = new Graphics();
+    const label = new BitmapText({ text: '', style: { fontFamily: 'village', fontSize: 32 } });
+    label.anchor.set(0.5, 0);
+    label.scale.set(5 / 32);
+    container.addChild(body, smoke, label);
+    return { container, body, smoke, label, labelText: null, sig: null, seen: 0 };
+  }
+
+  _setBuildLabel(view, text, color) {
+    if (view.labelText !== text) { view.label.text = text; view.labelText = text; }
+    view.label.tint = color;
+    view.label.x = 0; view.label.y = 14;
+  }
+
+  // building drawn in LOCAL coords around (0,0)
+  _drawBuildingBody(g, quality) {
+    g.clear();
+    const scale = quality === 'crude' ? 0.7 : quality === 'excellent' ? 1.2 : quality === 'good' ? 1.1 : 1;
+    g.ellipse(2, 12 * scale, 14 * scale, 5 * scale).fill({ color: 0x000000, alpha: 0.12 });
+    g.roundRect(-12 * scale, -2, 24 * scale, 16 * scale, 2).fill(quality === 'crude' ? 0x4a4030 : 0x5a5040);
+    const wallColor = (quality === 'good' || quality === 'excellent') ? 0x7a7a70 : 0x8B7355;
+    g.roundRect(-11 * scale, -6 * scale, 22 * scale, 16 * scale, 1).fill(wallColor);
+    g.roundRect(-10 * scale, -5 * scale, 20 * scale, 14 * scale, 1).fill(wallColor + 0x101010);
+    g.moveTo(-14 * scale, -6 * scale).lineTo(0, -18 * scale).lineTo(14 * scale, -6 * scale).fill(0xA0522D);
+    g.moveTo(-13 * scale, -6 * scale).lineTo(0, -16 * scale).lineTo(13 * scale, -6 * scale).fill(0xB06030);
+    g.roundRect(-3, 1, 6, 9 * scale, 1).fill(0x4a3020);
+    g.circle(2, 5, 0.8).fill(0xc0a060);
+    g.rect(5 * scale, -1, 5, 5).fill(0x3060a0);
+    g.rect(5 * scale, 1.5, 5, 0.5).fill(0x5a4030);
+    g.rect(7.5 * scale, -1, 0.5, 5).fill(0x5a4030);
+    if (quality !== 'crude') g.rect(6, -18 * scale, 4, 8).fill(0x6a5a5a);
+  }
+
+  // chimney smoke is the only per-tick animated bit; drawn into its own Graphics
+  _drawChimneySmoke(g, quality, tick) {
+    g.clear();
+    if (quality === 'crude') return;
+    if (this._timeOfDay !== 'night' && this._timeOfDay !== 'evening') return;
+    const scale = quality === 'excellent' ? 1.2 : quality === 'good' ? 1.1 : 1;
+    for (let i = 0; i < 3; i++) {
+      const sy = -20 * scale - i * 4 + Math.sin(tick * 0.03 + i) * 2;
+      g.circle(8 + Math.sin(tick * 0.02 + i * 2) * 2, sy, 2 - i * 0.4).fill({ color: 0x888888, alpha: 0.2 - i * 0.05 });
+    }
+  }
+
+  _drawConstruction(g, phase) {
+    g.clear();
+    if (phase === 'planning') {
+      for (let i = 0; i < 4; i++) {
+        const sx = [-10, 10, -10, 10][i], sy = [-8, -8, 8, 8][i];
+        g.rect(sx - 0.5, sy - 4, 1, 8).fill(0x8a7050);
+      }
+      g.moveTo(-10, -8).lineTo(10, -8).stroke({ color: 0x8a7050, width: 0.5, alpha: 0.5 });
+      g.moveTo(10, -8).lineTo(10, 8).stroke({ color: 0x8a7050, width: 0.5, alpha: 0.5 });
+      g.moveTo(10, 8).lineTo(-10, 8).stroke({ color: 0x8a7050, width: 0.5, alpha: 0.5 });
+      g.moveTo(-10, 8).lineTo(-10, -8).stroke({ color: 0x8a7050, width: 0.5, alpha: 0.5 });
+    } else if (phase === 'foundation') {
+      g.roundRect(-12, 4, 24, 6, 1).fill(0x5a5a50);
+      g.roundRect(-10, 2, 20, 4, 1).fill(0x6a6a58);
+      for (let i = 0; i < 3; i++) g.roundRect(14, -2 + i * 3, 8, 2.5, 1).fill(0x6a5030);
+    } else if (phase === 'walls') {
+      g.roundRect(-12, 2, 24, 8, 1).fill(0x5a5040);
+      g.roundRect(-11, -4, 3, 10, 1).fill(0x8B7355);
+      g.roundRect(8, -4, 3, 10, 1).fill(0x8B7355);
+      g.roundRect(-11, -4, 22, 3, 1).fill(0x8B7355);
+      g.rect(-14, -6, 1, 16).fill(0x7a6a50);
+      g.rect(13, -6, 1, 16).fill(0x7a6a50);
+      g.rect(-14, -2, 28, 1).fill(0x7a6a50);
+    } else if (phase === 'roof') {
+      g.roundRect(-12, -2, 24, 14, 1).fill(0x5a5040);
+      g.roundRect(-11, -6, 22, 16, 1).fill(0x8B7355);
+      g.moveTo(-14, -6).lineTo(-2, -14).lineTo(2, -14).fill(0xA0522D);
+      for (let i = 0; i < 2; i++) g.circle(-16 + i * 4, 6, 3).fill(0x8a9a50);
+    }
   }
 
   // ── CHARACTERS ──

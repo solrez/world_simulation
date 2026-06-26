@@ -1,3 +1,19 @@
+function topSkillOf(p) {
+  let best = null, max = 8;
+  for (const [k, v] of Object.entries(p.skills || {})) if (v > max) { max = v; best = k; }
+  return best;
+}
+
+// Compact view of what this agent has learned pays off, by context.
+function learnedRows(p) {
+  if (!p.qValues) return [];
+  return Object.entries(p.qValues)
+    .map(([k, v]) => ({ ctx: k.split(':')[0], action: k.split(':')[1], v }))
+    .filter(r => Math.abs(r.v) > 0.3)
+    .sort((a, b) => b.v - a.v)
+    .slice(0, 6);
+}
+
 export function SidePanel({ people, selectedPerson, onSelect, onFollow, following }) {
   const sel = selectedPerson !== null ? people[selectedPerson] : null;
 
@@ -38,9 +54,14 @@ export function SidePanel({ people, selectedPerson, onSelect, onFollow, followin
             <Stat label="Mood" value={sel.mood} emoji={moodEmoji(sel.mood)} />
             <Stat label="Activity" value={sel.sleeping ? '💤 sleeping' : sel.eating ? '🍎 eating' : sel.sick ? '🤒 sick' : sel.activity} />
             <Stat label="Location" value={sel.currentLocation} />
-            {sel.inventory && (
-              <Stat label="Inventory" value={`🍖${sel.inventory.food} 🪵${sel.inventory.wood || 0} 🪨${sel.inventory.stone || 0} 🌾${sel.inventory.thatch || 0}`} />
+            {sel.larder && (
+              <Stat label="Food" value={`🥩${sel.larder.meat || 0} 🐟${sel.larder.fish || 0} 🫐${sel.larder.berries || 0} 🌾${sel.larder.crops || 0}`} />
             )}
+            {sel.inventory && (
+              <Stat label="Materials" value={`🪵${sel.inventory.wood || 0} 🪨${sel.inventory.stone || 0} 🌿${sel.inventory.thatch || 0}`} />
+            )}
+            {sel.home && <Stat label="Home" value={`🏠 ${sel.home.type || 'shelter'}`} />}
+            {topSkillOf(sel) && <Stat label="Known for" value={`⭐ ${topSkillOf(sel)}`} />}
             {sel.buildProject && sel.buildProject.phase !== 'complete' && (
               <div className="build-tag">🏗 Building: {sel.buildProject.type} ({sel.buildProject.phase})</div>
             )}
@@ -60,8 +81,19 @@ export function SidePanel({ people, selectedPerson, onSelect, onFollow, followin
             {sel.skills && Object.values(sel.skills).some(v => v > 0) && (
               <>
                 <div className="section-label" style={{ marginTop: 8 }}>Skills</div>
-                {Object.entries(sel.skills).filter(([,v]) => v > 0).map(([skill, val]) => (
+                {Object.entries(sel.skills).filter(([,v]) => v > 0).sort((a, b) => b[1] - a[1]).map(([skill, val]) => (
                   <RelBar key={skill} label={skill} value={val} color="#a0a060" />
+                ))}
+              </>
+            )}
+
+            {learnedRows(sel).length > 0 && (
+              <>
+                <div className="section-label" style={{ marginTop: 8 }}>Learned (what pays off)</div>
+                {learnedRows(sel).map((r, i) => (
+                  <div key={i} className="learned-row" style={{ fontSize: 10, color: r.v > 0 ? '#80c080' : '#c08080', padding: '1px 0' }}>
+                    {r.action} <span style={{ opacity: 0.5 }}>({r.ctx})</span> {r.v > 0 ? '↑' : '↓'}{Math.abs(r.v).toFixed(1)}
+                  </div>
                 ))}
               </>
             )}

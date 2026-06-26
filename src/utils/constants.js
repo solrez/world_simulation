@@ -150,12 +150,65 @@ export const GATE = {
   JEALOUSY_LIVE: 40,
 };
 
+// ── Aging & reproduction pacing ──
+//
+// ONE knob drives everything: YEARS_PER_DAY — how many life-years pass per
+// game-day. Aging ties to the day rollover (so age tracks the calendar), and
+// every reproductive timing below is DERIVED from it in real-life terms, so
+// changing this one number keeps gestation ≈9 months, fertility ≈1 child/few
+// years, etc., all automatically in proportion.
+export const YEARS_PER_DAY = 1; // life-years per game-day (the master knob)
+
+// 1 game-day = 1440 ticks (one tick = one game-minute).
+export const TICKS_PER_DAY = 24 * 60;
+
+// Real-life reproductive constants, expressed in life-YEARS, then converted to
+// game-days via YEARS_PER_DAY so they scale with the master knob.
+export const GESTATION_YEARS = 9 / 12;     // ~9 months
+export const FERTILITY_INTERVAL_YEARS = 3; // avg life-years between conceptions per couple
+
+// Derived game-day / per-day-chance values (used by the sim). Gestation in
+// game-days: a 9-month pregnancy at 1 yr/day is 0.75 days; at 2 yr/day, 0.375.
+export const GESTATION_DAYS = GESTATION_YEARS / YEARS_PER_DAY;
+// Per-eligible-day conception chance s.t. expected wait ≈ FERTILITY_INTERVAL_YEARS.
+// expected_days = 1/p ; expected_days = FERTILITY_INTERVAL_YEARS / YEARS_PER_DAY.
+export const CONCEPTION_CHANCE = YEARS_PER_DAY / FERTILITY_INTERVAL_YEARS;
+
 export const CHILD_NAMES = {
   male: ['Ash', 'Cedar', 'Lark', 'Reed', 'Sage', 'Wren', 'Birch', 'Flint', 'Moss', 'Clay'],
   female: ['Ivy', 'Luna', 'Fern', 'Hazel', 'Lily', 'Willa', 'Delia', 'Maeve', 'Nora', 'Thea'],
 };
 
 export const SKILLS = ['fishing', 'building', 'foraging', 'storytelling', 'healing', 'hunting', 'crafting'];
+
+// ── Food economy (typed food + larder + spoilage) ──
+// Each food type has a hunger-restore value and a spoilage rate (fraction lost
+// per game-day in the shared larder). Variety in diet gives a small mood lift.
+export const FOOD_TYPES = {
+  meat:    { hunger: 30, spoilPerDay: 0.25 }, // from hunting — best, but risky to get
+  fish:    { hunger: 22, spoilPerDay: 0.30 }, // steady
+  berries: { hunger: 14, spoilPerDay: 0.40 }, // easy, abundant in summer
+  crops:   { hunger: 20, spoilPerDay: 0.10 }, // farmed — keeps longest
+};
+
+// ── Resource patches (depletion + regrowth) ──
+// Foraging a patch hard reduces its yield; it recovers over days. Forces agents
+// to roam and adapt instead of camping one spot forever.
+export const PATCH_MIN = 0.25;        // yield multiplier never drops below this
+export const PATCH_DEPLETE = 0.04;    // lost per successful harvest
+export const PATCH_REGROW_PER_DAY = 0.5;
+
+// ── Q-learning-lite ──
+export const Q_ALPHA = 0.2;     // learning rate (estimate moves this fraction toward reward)
+export const Q_EPSILON = 0.1;   // exploration: chance to try a non-top action
+
+// ── Seasonal abundance multipliers for foraging/hunting yields ──
+export const SEASON_ABUNDANCE = {
+  spring: { forage: 1.0, hunt: 1.0 },
+  summer: { forage: 1.4, hunt: 1.1 },
+  fall:   { forage: 1.1, hunt: 1.2 },
+  winter: { forage: 0.4, hunt: 0.7 },
+};
 
 export const WILDLIFE_TYPES = [
   { type: 'deer', speed: 0.2, fleeRange: 6, foodValue: 8, color: 0x8a6a40 },

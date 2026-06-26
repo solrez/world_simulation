@@ -8,6 +8,8 @@ import './App.css';
 
 const initialState = createSimulation();
 
+const larderTotal = (l) => l ? Math.round((l.meat || 0) + (l.fish || 0) + (l.berries || 0) + (l.crops || 0)) : 0;
+
 function App() {
   const [game, setGame] = useState(initialState);
   const [selectedPerson, setSelectedPerson] = useState(null);
@@ -200,7 +202,7 @@ function App() {
           <span className="sep">·</span>
           <span className="header-stat">{game.season}</span>
           <span className="sep">·</span>
-          <span className={`header-stat ${game.villageFood < 10 ? 'food-critical' : ''}`}>🍖 {Math.round(game.villageFood)}</span>
+          <span className={`header-stat ${larderTotal(game.larder) < 10 ? 'food-critical' : ''}`}>🍖 {larderTotal(game.larder)}</span>
         </div>
         <div className="header-right">
           <button className="hdr-btn export-btn" onClick={() => downloadConversationArchive()} title="Download all conversations as JSON">
