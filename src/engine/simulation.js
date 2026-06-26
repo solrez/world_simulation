@@ -1,4 +1,4 @@
-import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, SKILLS, AMBIENT_EVENTS, BUILD_REQUIREMENTS, BUILD_PHASES, WILDLIFE_TYPES } from '../utils/constants.js';
+import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, SKILLS, AMBIENT_EVENTS, BUILD_REQUIREMENTS, BUILD_PHASES, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE } from '../utils/constants.js';
 import { generateGroupDialogue, generateAction } from './ai.js';
 
 // ── Conversation Archive (persisted to localStorage) ──
@@ -193,6 +193,10 @@ function initPerson(config, index, startX, startY) {
     conversationId: null,
     conversationCooldown: 0,
     actionCooldown: 0,
+    // escalation gate
+    gateCooldown: 0,
+    eventSeen: 0,
+    pendingLLM: false,
     thought: null,
     idle: 0,
     speed: 0.35 + Math.random() * 0.1, // brisk walking pace
@@ -217,7 +221,7 @@ function initPerson(config, index, startX, startY) {
     // behavior lock
     currentGoal: null,
     // skills
-    skills: { fishing: 0, building: 0, foraging: 0, storytelling: 0, healing: 0 },
+    skills: { fishing: 0, building: 0, foraging: 0, storytelling: 0, healing: 0, crafting: 0 },
     // alive
     alive: true,
     // ambitions — generated at init
@@ -232,6 +236,10 @@ function initPerson(config, index, startX, startY) {
     favoriteLocation: null,
     // inventory
     inventory: { food: 5, wood: 0, stone: 0, thatch: 0 },
+    // crafted tools that boost gathering yields, plus in-progress craft state
+    tools: {},
+    craftTool: null,
+    craftProgress: 0,
     foodGathered: 0,
     // social
     flirting: null,
@@ -363,7 +371,7 @@ function updateWildlife(state) {
         target.tiredness = Math.min(100, target.tiredness + 10);
         target.mood = 'anxious';
         setEmote(target, 'fear', 30);
-        addMemory(target, `Was attacked by a ${animal.type}!`, 'danger', state.day);
+        addMemory(target, `Was attacked by a ${animal.type}!`, 'danger', state.day, { location: locationAt(target.x, target.y) });
         state.events.push({ day: state.day, hour: state.hour, participants: [target.name], summary: `🐺 ${target.name} was attacked by a ${animal.type}!`, type: 'danger' });
       }
     }
@@ -465,7 +473,7 @@ function pickTarget(person, people, state) {
       // go gather resources, explore, or build
       if (Math.random() < 0.5) {
         const workLocs = ['Berry Bush', 'Fishing Spot', 'Grove', 'Well'];
-        const loc = workLocs[Math.floor(Math.random() * workLocs.length)];
+        const loc = weightedLocationPick(person, workLocs);
         goToLocation(person, loc);
         person.activity = 'working';
         setGoal(person, 'work', loc, 40);
@@ -518,7 +526,7 @@ function pickSocialTarget(person, people) {
 function pickMoodTarget(person) {
   const moodLocs = MOOD_LOCATIONS[person.mood];
   if (moodLocs && Math.random() < 0.7) {
-    const name = moodLocs[Math.floor(Math.random() * moodLocs.length)];
+    const name = weightedLocationPick(person, moodLocs);
     goToLocation(person, name);
   } else {
     pickExploreTarget(person);
@@ -528,7 +536,8 @@ function pickMoodTarget(person) {
 
 function pickExploreTarget(person) {
   const locs = Object.values(LOCATIONS);
-  const loc = locs[Math.floor(Math.random() * locs.length)];
+  const name = weightedLocationPick(person, locs.map(l => l.name));
+  const loc = locs.find(l => l.name === name) || locs[Math.floor(Math.random() * locs.length)];
   person.targetX = loc.x + (Math.random() - 0.5) * 4;
   person.targetY = loc.y + (Math.random() - 0.5) * 4;
   person.targetX = clamp(person.targetX, 1, MAP_W - 2);
@@ -537,9 +546,62 @@ function pickExploreTarget(person) {
   setGoal(person, 'wander', null, 30);
 }
 
-function addMemory(person, text, type, day) {
-  person.memories.push({ text, type, day });
+function addMemory(person, text, type, day, opts = {}) {
+  const valence = opts.valence ?? MEMORY_VALENCE[type] ?? 0;
+  const location = opts.location ?? null;
+  person.memories.push({ text, type, day, valence, location, weight: Math.abs(valence) });
   if (person.memories.length > 30) person.memories.shift();
+}
+
+// Decay memory weights toward zero over days and prune faded ones. Cheap —
+// called once per game-day, not per tick.
+function decayMemories(person, state) {
+  if (!person.memories?.length) return;
+  person.memories = person.memories.filter(m => {
+    if (m.valence === undefined) return true; // legacy memory, never anchored
+    const ageDays = Math.max(0, state.day - m.day);
+    const halfLife = m.valence < 0 ? MEMORY_HALF_LIFE_BAD : MEMORY_HALF_LIFE_GOOD;
+    m.weight = Math.abs(m.valence) * Math.pow(0.5, ageDays / halfLife);
+    return m.weight >= MEMORY_MIN_WEIGHT;
+  });
+}
+
+// Signed feeling about a place: sum of decayed weights * sign(valence) over
+// memories anchored to that location. Positive = drawn to it, negative = avoid.
+function locationValence(person, locName) {
+  if (!person.memories?.length) return 0;
+  let sum = 0;
+  for (const m of person.memories) {
+    if (m.location === locName && m.valence) sum += m.weight * Math.sign(m.valence);
+  }
+  return sum;
+}
+
+// Signed feeling about another person, by name, from memories that mention them.
+function personValence(person, otherName) {
+  if (!person.memories?.length || !otherName) return 0;
+  let sum = 0;
+  for (const m of person.memories) {
+    if (m.valence && m.text && m.text.includes(otherName)) sum += m.weight * Math.sign(m.valence);
+  }
+  return sum;
+}
+
+// Softmax over candidate location names weighted by the person's feelings about
+// each. A strong aversion sharply downweights but never hard-bans a place;
+// a fond memory upweights it. With no memories this is a uniform random pick.
+function weightedLocationPick(person, names) {
+  if (!names?.length) return null;
+  if (!person.memories?.length) return names[Math.floor(Math.random() * names.length)];
+  const weights = names.map(n => Math.exp(locationValence(person, n) * MEMORY_LOCATION_SENSITIVITY));
+  const total = weights.reduce((a, b) => a + b, 0);
+  if (!(total > 0)) return names[Math.floor(Math.random() * names.length)];
+  let r = Math.random() * total;
+  for (let i = 0; i < names.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return names[i];
+  }
+  return names[names.length - 1];
 }
 
 function setEmote(person, emote, duration) {
@@ -562,7 +624,7 @@ function updateRelationshipStage(person, otherName, people) {
     // partnered can degrade to dating if trust/affection drops
     if (affection < 35 || trust < 30) {
       rel.stage = RELATIONSHIP_STAGES.DATING;
-      addMemory(person, `Relationship with ${otherName} is struggling`, 'life', 0);
+      addMemory(person, `Relationship with ${otherName} is struggling`, 'life', 0, { valence: -1.5 });
     }
     return;
   }
@@ -584,7 +646,7 @@ function updateRelationshipStage(person, otherName, people) {
         person.partner = null;
         other.partner = null;
         person.mood = 'sad';
-        addMemory(person, `Stopped dating ${otherName}`, 'life', 0);
+        addMemory(person, `Stopped dating ${otherName}`, 'life', 0, { valence: -1.5 });
       }
     }
     return;
@@ -667,121 +729,132 @@ function updateNeeds(person, timeOfDay, weather) {
   }
 }
 
-// needs-driven behavior — only fires when NO active goal
-function needsDrivenBehavior(person, people, state) {
-  if (person.conversationId || person.sleeping || person.eating) return;
-  if (person.lifeStage === LIFE_STAGES.BABY) return;
-  if (person.currentGoal && person.currentGoal.until > 0) return;
+// ── Escalation gate ──
+//
+// Per-person, per-tick verdict that decides who gets to "think":
+//   REFLEX   — a one-answer survival situation; handle it locally, no LLM call.
+//   ESCALATE — an interesting situation (conflict, competing desires, fresh
+//              event, goal tension); mark pendingLLM so the LLM decides. The
+//              LLM keeps ALL character/social/goal choices.
+//   IDLE     — nothing urgent; the cheap local schedule wander handles it.
+//
+// This removes the old three-way race (needs + schedule + LLM all firing on the
+// same tick) and stops spending LLM calls on reflexes that have one answer.
+function escalationGate(person, people, state) {
+  if (person.conversationId || person.sleeping || person.eating) return { verdict: 'IDLE' };
+  if (person.lifeStage === LIFE_STAGES.BABY) return { verdict: 'IDLE' };
+  if (person.currentGoal && person.currentGoal.until > 0) return { verdict: 'IDLE' };
 
-  // critical: exhausted → sleep
-  if (person.tiredness > 80) {
-    person.sleeping = true;
-    person.activity = 'sleeping';
-    person.targetX = null; person.targetY = null;
-    setEmote(person, 'zzz', 999);
-    setGoal(person, 'sleep', null, 500);
-    if (person.home) { person.targetX = person.home.x; person.targetY = person.home.y; }
-    return;
+  // ── reflexes: single-answer survival, handled locally ──
+  if (person.tiredness > GATE.EXHAUSTED) return { verdict: 'REFLEX', reflex: 'sleep' };
+  if (state.timeOfDay === 'night' && person.tiredness > GATE.NIGHT_TIRED && !person.targetX) {
+    return { verdict: 'REFLEX', reflex: 'sleep' };
   }
+  if (person.sick && person.tiredness > GATE.SICK_TIRED) return { verdict: 'REFLEX', reflex: 'sleep' };
+  if (person.hunger > GATE.STARVING) return { verdict: 'REFLEX', reflex: 'eat' };
+  if (state.weather === 'storm') return { verdict: 'REFLEX', reflex: 'shelter' };
 
-  // night + tired → sleep
-  if (state.timeOfDay === 'night' && person.tiredness > 35 && !person.targetX) {
-    person.sleeping = true;
-    person.activity = 'sleeping';
-    setEmote(person, 'zzz', 999);
-    setGoal(person, 'sleep', null, 500);
-    if (person.home) { person.targetX = person.home.x; person.targetY = person.home.y; }
-    return;
-  }
+  // ── escalation triggers (skip while on cooldown) ──
+  if (person.gateCooldown <= 0) {
+    // 1. fresh high-salience event since we last looked
+    const lastMem = person.memories?.[person.memories.length - 1];
+    if (lastMem && person.memories.length > person.eventSeen &&
+        ['danger', 'death', 'conflict', 'kindness'].includes(lastMem.type)) {
+      person.eventSeen = person.memories.length;
+      return { verdict: 'ESCALATE' };
+    }
 
-  // hungry → eat from inventory first, then go gather
-  if (person.hunger > 55) {
-    if (person.inventory.food > 0) {
-      // eat from personal inventory
-      person.inventory.food--;
-      person.hunger = clamp(person.hunger - 25, 0, 100);
-      person.eating = true;
-      person.activity = 'eating';
-      setEmote(person, 'eat', 30);
-      setGoal(person, 'eat', null, 30);
-      return;
-    }
-    // try village food storage
-    if (state.villageFood > 5) {
-      state.villageFood -= 2;
-      person.hunger = clamp(person.hunger - 20, 0, 100);
-      person.eating = true;
-      person.activity = 'eating';
-      setEmote(person, 'eat', 30);
-      setGoal(person, 'eat', null, 30);
-      return;
-    }
-    // go gather food
-    const foodLocs = Object.values(LOCATIONS).filter(l => l.type === 'food');
-    const loc = foodLocs[Math.floor(Math.random() * foodLocs.length)];
-    if (loc) {
-      goToLocation(person, loc.name);
-      person.activity = 'gathering';
-      setGoal(person, 'work', loc.name, 100);
-    }
-    return;
-  }
-
-  // share food with hungry friends/partner nearby
-  if (person.inventory.food > 3) {
+    // 2. live relationship conflict with someone nearby
     for (const other of people) {
-      if (other.name === person.name || other.alive === false || other.hunger < 50) continue;
-      if (distBetween(person, other) > 4) continue;
+      if (other.name === person.name || other.alive === false) continue;
+      if (distBetween(person, other) > 5) continue;
       const rel = person.relationships[other.name];
       if (!rel) continue;
-      // share with partner, friends, or people you're attracted to
-      if (person.partner === other.name || rel.affection > 55 || rel.attraction > 60) {
-        person.inventory.food -= 2;
-        other.inventory.food += 2;
-        other.hunger = clamp(other.hunger - 15, 0, 100);
-        setEmote(person, 'heart', 15);
-        rel.affection = clamp(rel.affection + 2, 0, 100);
-        const otherRel = other.relationships[person.name];
-        if (otherRel) otherRel.affection = clamp(otherRel.affection + 3, 0, 100);
-        addMemory(other, `${person.name} shared food with me`, 'kindness', state.day);
-        person.thought = `I gave food to ${other.name}`;
-        break;
+      if (rel.jealousy > GATE.JEALOUSY_LIVE ||
+          rel.stage === RELATIONSHIP_STAGES.RIVAL || rel.stage === RELATIONSHIP_STAGES.ENEMY) {
+        return { verdict: 'ESCALATE' };
       }
     }
-  }
 
-  // sick → rest
-  if (person.sick && person.tiredness > 30) {
-    person.sleeping = true;
-    person.activity = 'sleeping';
-    setEmote(person, 'zzz', 999);
-    setGoal(person, 'sleep', null, 200);
-    if (person.home) { person.targetX = person.home.x; person.targetY = person.home.y; }
-    return;
-  }
-
-  // rainy/storm → seek shelter
-  if ((state.weather === 'rainy' || state.weather === 'storm') && Math.random() < 0.3) {
-    if (person.home) {
-      person.targetX = person.home.x; person.targetY = person.home.y;
-    } else {
-      goToLocation(person, 'Campfire');
+    // 3. competing desires — two mid-band needs at once, no single reflex answers
+    const hungerMid = person.hunger >= GATE.HUNGER_BAND[0] && person.hunger <= GATE.HUNGER_BAND[1];
+    const tiredMid = person.tiredness >= GATE.TIRED_BAND[0] && person.tiredness <= GATE.TIRED_BAND[1];
+    const lonely = person.loneliness > GATE.LONELY_MID;
+    const buildingNeedsWork = person.buildProject && person.buildProject.phase !== 'complete';
+    if ((hungerMid && lonely) || (tiredMid && lonely) || (tiredMid && buildingNeedsWork)) {
+      return { verdict: 'ESCALATE' };
     }
-    setGoal(person, 'shelter', null, 80);
-    return;
+
+    // 4. the village is running out of food — a real "do I go help?" choice
+    if (state.villageFood < 20 && (person.inventory.food || 0) < 5 && Math.random() < 0.1) {
+      return { verdict: 'ESCALATE' };
+    }
   }
 
-  // proactive: if village food is low, go gather regardless of personal hunger
-  if (state.villageFood < 20 && person.inventory.food < 5 && Math.random() < 0.15) {
-    const foodLocs = Object.values(LOCATIONS).filter(l => l.type === 'food');
-    const loc = foodLocs[Math.floor(Math.random() * foodLocs.length)];
-    if (loc) {
-      goToLocation(person, loc.name);
-      person.activity = 'working';
-      person.thought = 'The village needs more food...';
-      setGoal(person, 'work', loc.name, 120);
+  return { verdict: 'IDLE' };
+}
+
+// Apply a single-answer reflex locally — no LLM, no discretion.
+function applyReflex(person, reflex, state) {
+  switch (reflex) {
+    case 'sleep': {
+      person.sleeping = true;
+      person.activity = 'sleeping';
+      person.targetX = null; person.targetY = null;
+      setEmote(person, 'zzz', 999);
+      setGoal(person, 'sleep', null, person.sick ? 200 : 500);
+      if (person.home) { person.targetX = person.home.x; person.targetY = person.home.y; }
+      break;
     }
-    return;
+    case 'eat': {
+      if (person.inventory.food > 0) {
+        person.inventory.food--;
+        person.hunger = clamp(person.hunger - 25, 0, 100);
+        person.eating = true; person.activity = 'eating';
+        setEmote(person, 'eat', 30); setGoal(person, 'eat', null, 30);
+      } else if (state.villageFood > 5) {
+        state.villageFood -= 2;
+        person.hunger = clamp(person.hunger - 20, 0, 100);
+        person.eating = true; person.activity = 'eating';
+        setEmote(person, 'eat', 30); setGoal(person, 'eat', null, 30);
+      } else {
+        const foodLocs = Object.values(LOCATIONS).filter(l => l.type === 'food');
+        const loc = weightedLocationPick(person, foodLocs.map(l => l.name));
+        if (loc) { goToLocation(person, loc); person.activity = 'gathering'; setGoal(person, 'work', loc, 100); }
+      }
+      break;
+    }
+    case 'shelter': {
+      if (person.home) { person.targetX = person.home.x; person.targetY = person.home.y; }
+      else goToLocation(person, 'Campfire');
+      setGoal(person, 'shelter', null, 80);
+      break;
+    }
+  }
+}
+
+// Passive generosity: sharing food with a hungry loved one nearby isn't really
+// a "decision" — it's an automatic kind act. Runs every tick regardless of the
+// gate, preserving the kindness-memory / affection mechanic.
+function processFoodSharing(person, people, state) {
+  if (person.sleeping || person.eating || (person.inventory.food || 0) <= 3) return;
+  for (const other of people) {
+    if (other.name === person.name || other.alive === false || other.hunger < 50) continue;
+    if (distBetween(person, other) > 4) continue;
+    const rel = person.relationships[other.name];
+    if (!rel) continue;
+    if (person.partner === other.name || rel.affection > 55 || rel.attraction > 60) {
+      person.inventory.food -= 2;
+      other.inventory.food += 2;
+      other.hunger = clamp(other.hunger - 15, 0, 100);
+      setEmote(person, 'heart', 15);
+      rel.affection = clamp(rel.affection + 2, 0, 100);
+      const otherRel = other.relationships[person.name];
+      if (otherRel) otherRel.affection = clamp(otherRel.affection + 3, 0, 100);
+      addMemory(other, `${person.name} shared food with me`, 'kindness', state.day, { location: other.currentLocation });
+      person.thought = `I gave food to ${other.name}`;
+      break;
+    }
   }
 }
 
@@ -979,10 +1052,11 @@ export function simulateTick(state) {
   const next = { ...state, tick: state.tick + 1 };
 
   // 1 game-minute per tick. At 400ms tick interval, 1 day = 1440 ticks = ~9.6 real minutes
+  let dayRolled = false;
   next.minute += 1;
   if (next.minute >= 60) {
     next.minute = 0; next.hour++;
-    if (next.hour >= 24) { next.hour = 0; next.day++;
+    if (next.hour >= 24) { next.hour = 0; next.day++; dayRolled = true;
       next.weather = Math.random() < 0.25 ? 'rainy' : Math.random() < 0.15 ? 'cloudy' : 'clear';
     }
   }
@@ -995,6 +1069,7 @@ export function simulateTick(state) {
 
     if (person.conversationCooldown > 0) person.conversationCooldown--;
     if (person.actionCooldown > 0) person.actionCooldown--;
+    if (person.gateCooldown > 0) person.gateCooldown--;
     if (person.emoteTimer > 0) { person.emoteTimer--; if (person.emoteTimer <= 0) person.emote = null; }
     if (person.currentGoal) {
       person.currentGoal.until--;
@@ -1005,6 +1080,7 @@ export function simulateTick(state) {
     updateMoodFromNeeds(person);
     updateJealousy(person, alivePeople);
     updateSkills(person);
+    if (dayRolled) decayMemories(person, next);
     processBreakups(person, alivePeople, next);
     processIllness(person, next);
     processGrief(person);
@@ -1069,7 +1145,15 @@ export function simulateTick(state) {
       continue;
     }
 
-    needsDrivenBehavior(person, alivePeople, next);
+    processFoodSharing(person, alivePeople, next);
+
+    const gate = escalationGate(person, alivePeople, next);
+    if (gate.verdict === 'REFLEX') {
+      applyReflex(person, gate.reflex, next);
+    } else if (gate.verdict === 'ESCALATE') {
+      person.pendingLLM = true; // the AI interval will pick this person up
+      // leave the slot open for the LLM — don't run the local schedule this tick
+    }
 
     if (person.targetX !== null) {
       const arrived = moveToward(person, person.targetX, person.targetY);
@@ -1084,7 +1168,7 @@ export function simulateTick(state) {
           }
         }
       }
-    } else {
+    } else if (gate.verdict === 'IDLE') {
       person.idle++;
       if (person.idle > 8) { pickTarget(person, alivePeople, next); person.idle = 0; }
     }
@@ -1110,14 +1194,31 @@ export function simulateTick(state) {
 
 // ── Skills (with gameplay effects) ──
 
+// pick the tool a person would most benefit from: matches a needed gathering
+// skill they don't already have a tool for.
+function chooseToolToCraft(person) {
+  const tools = person.tools || {};
+  const options = [
+    { tool: 'fishing_rod', skill: 'fishing' },
+    { tool: 'axe', skill: 'building' },
+    { tool: 'forage_basket', skill: 'foraging' },
+  ].filter(o => !tools[o.tool]);
+  if (!options.length) return 'fishing_rod'; // already has all; remake the first
+  // favor the skill they use most (highest), so the tool pays off
+  options.sort((a, b) => (person.skills[b.skill] || 0) - (person.skills[a.skill] || 0));
+  return options[0].tool;
+}
+
 function updateSkills(person) {
   const loc = person.currentLocation;
+  const tools = person.tools || {};
 
   // food gathering
   if (person.activity === 'working' || person.activity === 'gathering') {
     if (loc === 'Fishing Spot') {
       person.skills.fishing = Math.min(100, person.skills.fishing + 0.02);
-      if (Math.random() < 0.005 + person.skills.fishing * 0.0003) {
+      const chance = (0.005 + person.skills.fishing * 0.0003) * (tools.fishing_rod ? 1.6 : 1);
+      if (Math.random() < chance) {
         const amount = 1 + Math.floor(person.skills.fishing / 25);
         person.inventory.food += amount;
         person.foodGathered += amount;
@@ -1125,7 +1226,8 @@ function updateSkills(person) {
       }
     } else if (loc === 'Berry Bush') {
       person.skills.foraging = Math.min(100, person.skills.foraging + 0.02);
-      if (Math.random() < 0.005 + person.skills.foraging * 0.0003) {
+      const chance = (0.005 + person.skills.foraging * 0.0003) * (tools.forage_basket ? 1.6 : 1);
+      if (Math.random() < chance) {
         const amount = 1 + Math.floor(person.skills.foraging / 25);
         person.inventory.food += amount;
         person.foodGathered += amount;
@@ -1137,10 +1239,26 @@ function updateSkills(person) {
   // chopping wood at Grove
   if ((person.activity === 'chopping' || person.activity === 'working') && loc === 'Grove') {
     person.skills.building = Math.min(100, person.skills.building + 0.02);
-    if (Math.random() < 0.004 + person.skills.building * 0.0002) {
+    if (Math.random() < (0.004 + person.skills.building * 0.0002) * (tools.axe ? 1.6 : 1)) {
       person.inventory.wood++;
       person.thought = `Chopped a log! (${person.inventory.wood} total)`;
       setEmote(person, 'sparkle', 8);
+    }
+  }
+
+  // crafting a tool — progresses while activity is 'crafting'; faster with skill
+  if (person.activity === 'crafting' && person.craftTool) {
+    person.skills.crafting = Math.min(100, (person.skills.crafting || 0) + 0.05);
+    person.craftProgress = (person.craftProgress || 0) + 1 + person.skills.crafting * 0.02;
+    if (person.craftProgress >= 40) {
+      person.tools = { ...(person.tools || {}), [person.craftTool]: true };
+      const made = person.craftTool.replace('_', ' ');
+      person.thought = `Finished crafting a ${made}!`;
+      setEmote(person, 'sparkle', 12);
+      addMemory(person, `Crafted a ${made}`, 'achievement', person._craftDay ?? 0, { location: person.currentLocation });
+      person.craftTool = null;
+      person.craftProgress = 0;
+      person.activity = 'idle';
     }
   }
 
@@ -1156,7 +1274,7 @@ function updateSkills(person) {
   // gathering thatch at Meadow
   if ((person.activity === 'gathering' || person.activity === 'working') && loc === 'Meadow') {
     person.skills.foraging = Math.min(100, person.skills.foraging + 0.01);
-    if (Math.random() < 0.005 + person.skills.foraging * 0.0003) {
+    if (Math.random() < (0.005 + person.skills.foraging * 0.0003) * (tools.forage_basket ? 1.6 : 1)) {
       person.inventory.thatch++;
       person.thought = `Gathered thatch! (${person.inventory.thatch} total)`;
     }
@@ -1207,7 +1325,7 @@ function processIllness(person, state) {
     if (person.sickTimer <= 0) {
       person.sick = false;
       person.mood = 'content';
-      addMemory(person, 'Recovered from illness', 'life', state.day);
+      addMemory(person, 'Recovered from illness', 'life', state.day, { location: person.currentLocation });
     }
     // healer nearby can speed recovery
     const alivePeople = state.people.filter(p => p.alive !== false && p.name !== person.name);
@@ -1237,7 +1355,7 @@ function processIllness(person, state) {
     person.sickTimer = 200 + Math.floor(Math.random() * 200); // ~3-7 game-hours
     person.mood = 'sad';
     setEmote(person, 'sick', 30);
-    addMemory(person, 'Fell ill', 'life', state.day);
+    addMemory(person, 'Fell ill', 'life', state.day, { valence: -1, location: person.currentLocation });
     state.events.push({ day: state.day, hour: state.hour, participants: [person.name], summary: `${person.name} has fallen ill.`, type: 'illness' });
   }
 }
@@ -1335,13 +1453,17 @@ function processPersonalityConflict(person, people, state) {
       if (person.traits.includes(a) && other.traits.includes(b)) clashScore++;
       if (person.traits.includes(b) && other.traits.includes(a)) clashScore++;
     }
-    if (clashScore > 0 && Math.random() < 0.0002 * clashScore) {
+    // accumulated emotional history with this person colors the odds:
+    // a bad history makes clashes likelier, a good one dampens them.
+    const pv = personValence(person, other.name);
+    const clashMod = pv < -2 ? 1.6 : pv > 2 ? 0.5 : 1;
+    if (clashScore > 0 && Math.random() < 0.0002 * clashScore * clashMod) {
       // trigger a disagreement
       rel.trust = Math.max(0, rel.trust - 3);
       rel.affection = Math.max(0, rel.affection - 2);
       person.mood = 'annoyed';
       setEmote(person, 'anger', 15);
-      addMemory(person, `Had a disagreement with ${other.name}`, 'conflict', state.day);
+      addMemory(person, `Had a disagreement with ${other.name}`, 'conflict', state.day, { location: person.currentLocation });
       state.events.push({ day: state.day, hour: state.hour, participants: [person.name, other.name], summary: `${person.name} and ${other.name} had a personality clash.`, type: 'conflict' });
     }
 
@@ -1349,11 +1471,11 @@ function processPersonalityConflict(person, people, state) {
     const sharedValues = person.values.filter(v => other.values.includes(v)).length;
     if (sharedValues === 0 && rel.familiarity > 25 && Math.random() < 0.0001) {
       rel.trust = Math.max(0, rel.trust - 2);
-      addMemory(person, `Disagrees with ${other.name}'s values`, 'conflict', state.day);
+      addMemory(person, `Disagrees with ${other.name}'s values`, 'conflict', state.day, { location: person.currentLocation });
     }
 
-    // reconciliation — high trust can repair
-    if (rel.stage === RELATIONSHIP_STAGES.RIVAL && rel.trust > 40 && Math.random() < 0.005) {
+    // reconciliation — high trust can repair, and fond history makes it likelier
+    if (rel.stage === RELATIONSHIP_STAGES.RIVAL && rel.trust > 40 && Math.random() < 0.005 * (pv > 2 ? 2 : 1)) {
       rel.stage = RELATIONSHIP_STAGES.ACQUAINTANCE;
       rel.affection = Math.min(100, rel.affection + 10);
       addMemory(person, `Made amends with ${other.name}`, 'life', state.day);
@@ -1430,14 +1552,14 @@ function processBreakups(person, people, state) {
       partner.partner = null;
       partner.mood = 'heartbroken';
       setEmote(partner, 'tear', 60);
-      addMemory(partner, `Broke up with ${person.name}`, 'life', state.day);
+      addMemory(partner, `Broke up with ${person.name}`, 'life', state.day, { valence: -2 });
     }
     rel.stage = RELATIONSHIP_STAGES.ACQUAINTANCE;
     rel.attraction = Math.max(0, rel.attraction - 20);
     person.partner = null;
     person.mood = 'heartbroken';
     setEmote(person, 'tear', 60);
-    addMemory(person, `Broke up with ${partnerName}`, 'life', state.day);
+    addMemory(person, `Broke up with ${partnerName}`, 'life', state.day, { valence: -2 });
     state.events.push({ day: state.day, hour: state.hour, participants: [person.name, partnerName].filter(Boolean), summary: `${person.name} and ${partnerName} broke up.`, type: 'breakup' });
   }
 
@@ -1496,6 +1618,7 @@ function processSeasonalEvents(state) {
       p.loneliness = Math.max(0, p.loneliness - 20);
       setEmote(p, 'sparkle', 30);
       if (event.name === 'Storytelling Night') p.skills.storytelling = Math.min(100, p.skills.storytelling + 1);
+      addMemory(p, `Joined the ${event.name} at the Campfire`, 'kindness', state.day, { location: 'Campfire' });
     }
     state.events.push({ day: state.day, hour: state.hour, participants: alivePeople.map(p => p.name), summary: `🎉 ${event.name}! ${event.desc}`, type: 'seasonal' });
   }
@@ -1575,8 +1698,11 @@ export async function runConversation(gameRef, participantIndices, onUpdate) {
       for (const [name, changes] of Object.entries(result.relationship_changes)) {
         const rel = speaker.relationships[name];
         if (!rel) continue;
-        rel.affection = clamp(rel.affection + (changes.affection || 0), 0, 100);
-        rel.trust = clamp(rel.trust + (changes.trust || 0), 0, 100);
+        // durable emotional history applies a tiny slow pressure on top of the
+        // LLM's per-line deltas, without overriding them.
+        const nudge = clamp(personValence(speaker, name) * 0.2, -1, 1);
+        rel.affection = clamp(rel.affection + (changes.affection || 0) + nudge, 0, 100);
+        rel.trust = clamp(rel.trust + (changes.trust || 0) + nudge, 0, 100);
         rel.attraction = clamp(rel.attraction + (changes.attraction || 0), 0, 100);
         rel.familiarity = clamp(rel.familiarity + 2, 0, 100); // +2 per line, not +1
       }
@@ -1656,7 +1782,7 @@ export async function runConversation(gameRef, participantIndices, onUpdate) {
     // also add a short memory summary
     const otherNames = conversation.participants.filter(n => n !== p.name).join(', ');
     const lastThing = transcript.slice(-1)[0];
-    addMemory(p, `Talked with ${otherNames} at ${conversation.location}. Last thing said: "${lastThing?.text?.slice(0, 80) || '...'}"`, 'conversation', gameRef.current.day);
+    addMemory(p, `Talked with ${otherNames} at ${conversation.location}. Last thing said: "${lastThing?.text?.slice(0, 80) || '...'}"`, 'conversation', gameRef.current.day, { location: conversation.location });
   }
 
   // persist to global conversation archive for analysis
@@ -1691,6 +1817,10 @@ function pickNextSpeaker(participants, lastSpeakerIdx, speakCount, lines) {
 
 export async function runAIAction(gameRef, personIdx) {
   const person = gameRef.current.people[personIdx];
+  // this person's LLM turn is being consumed — clear the flag and start the
+  // escalation cooldown so one event doesn't spam calls.
+  person.pendingLLM = false;
+  person.gateCooldown = GATE.ESCALATE_COOLDOWN;
   if (person.conversationId || person.sleeping || person.eating) return;
   if (person.lifeStage === LIFE_STAGES.BABY) return;
   // only skip if cooldown AND already has a goal
@@ -1812,7 +1942,7 @@ export async function runAIAction(gameRef, personIdx) {
             person.foodGathered += prey.foodValue;
             person.skills.hunting = Math.min(100, (person.skills.hunting || 0) + 1);
             setEmote(person, 'sparkle', 20);
-            addMemory(person, `Caught a ${prey.type}! Got ${prey.foodValue} food.`, 'achievement', cs.day);
+            addMemory(person, `Caught a ${prey.type}! Got ${prey.foodValue} food.`, 'achievement', cs.day, { location: person.currentLocation });
             cs.events.push({ day: cs.day, hour: cs.hour, participants: [person.name], summary: `🏹 ${person.name} caught a ${prey.type}!`, type: 'hunt' });
           }
         }
@@ -1836,18 +1966,24 @@ export async function runAIAction(gameRef, personIdx) {
     }
 
     case 'craft': {
-      // crafting uses materials from inventory
+      // craft a tool that boosts gathering. Costs wood — gather first if short.
+      if ((person.inventory.wood || 0) < 2) {
+        goToLocation(person, 'Grove');
+        person.activity = 'chopping';
+        setGoal(person, 'work', 'Grove', 60);
+        person.thought = 'Need more wood before I can make a tool.';
+        break;
+      }
+      person.inventory.wood -= 2;
+      person.craftTool = chooseToolToCraft(person);
+      person.craftProgress = 0;
+      person._craftDay = cs.day;
       person.activity = 'crafting';
-      person.skills.crafting = Math.min(100, (person.skills.crafting || 0) + 0.5);
-      setGoal(person, 'craft', null, 60);
-      break;
-    }
-
-    case 'tend_crops': {
-      goToLocation(person, 'Meadow');
-      person.activity = 'farming';
-      setGoal(person, 'farm', null, 100);
-      // farming produces food over time (handled in skills update)
+      // craft near a workshop if one exists, else the Campfire
+      const workshop = (cs.buildings || []).find(b => /workshop/i.test(b.type || ''));
+      goToLocation(person, workshop ? 'Campfire' : 'Campfire');
+      setGoal(person, 'craft', null, 80);
+      person.thought = `Making a ${person.craftTool.replace('_', ' ')}.`;
       break;
     }
 

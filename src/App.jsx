@@ -58,7 +58,7 @@ function App() {
         rendererRef.current.updateWildlife(next.wildlife);
         rendererRef.current.updateBubbles(next.activeConversations, next.people);
         rendererRef.current.updateCampfire();
-        rendererRef.current.updateDayNight(next.timeOfDay);
+        rendererRef.current.updateDayNight(next.timeOfDay, next.hour + next.minute / 60);
         rendererRef.current.updateWeather(next.weather);
         rendererRef.current.updateTrails(next.people);
         rendererRef.current.drawTrails();
@@ -95,21 +95,22 @@ function App() {
     return () => clearInterval(convoInterval);
   }, [speed, paused]);
 
-  // AI actions — primary brain, runs frequently for each person
+  // AI actions — the escalation gate flags who is "interesting" (pendingLLM);
+  // we spend an LLM call only on them. When nobody is flagged, zero calls.
   useEffect(() => {
     if (paused) return;
     const actionInterval = setInterval(async () => {
-      // pick a random alive person who isn't busy
-      const people = gameRef.current.people.filter(p =>
-        p.alive !== false && !p.conversationId && !p.sleeping && !p.eating &&
+      const candidates = gameRef.current.people.filter(p =>
+        p.pendingLLM && p.alive !== false && !p.conversationId && !p.sleeping && !p.eating &&
         p.lifeStage !== 'baby'
       );
-      if (!people.length) return;
-      const person = people[Math.floor(Math.random() * people.length)];
+      if (!candidates.length) return; // nothing interesting — no LLM call this round
+      // oldest-flagged first (they've waited longest)
+      const person = candidates[0];
       const idx = gameRef.current.people.indexOf(person);
       await runAIAction(gameRef, idx);
       setGame({ ...gameRef.current });
-    }, 4000 / speed); // every 4 seconds at 1x — each person gets called ~once per 16 seconds
+    }, 2000 / speed); // can poll more often now that most rounds no-op
     return () => clearInterval(actionInterval);
   }, [speed, paused]);
 

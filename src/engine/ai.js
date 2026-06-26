@@ -1,25 +1,10 @@
-const API_KEY = import.meta.env.VITE_OPENAI_API_KEY;
-const API_URL = 'https://api.openai.com/v1/chat/completions';
-const MODEL = 'gpt-4.1-nano';
+import { getProvider } from './providers/provider.js';
 
-async function callOpenAI(systemPrompt, userPrompt, temperature = 0.9, maxTokens = 500) {
-  try {
-    const resp = await fetch(API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${API_KEY}` },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-        temperature, max_tokens: maxTokens,
-        response_format: { type: 'json_object' },
-      }),
-    });
-    if (!resp.ok) { console.warn('OpenAI API error:', resp.status, await resp.text()); return null; }
-    const data = await resp.json();
-    const text = data.choices?.[0]?.message?.content;
-    if (!text) return null;
-    return JSON.parse(text);
-  } catch (e) { console.warn('AI error:', e); return null; }
+// All model calls go through the active provider (OpenAI by default, swappable
+// to local/Claude via VITE_AI_PROVIDER). callLLM keeps the old callOpenAI
+// signature so the three call sites below stay unchanged.
+function callLLM(systemPrompt, userPrompt, temperature = 0.9, maxTokens = 500, label) {
+  return getProvider().complete({ system: systemPrompt, user: userPrompt, temperature, maxTokens, label });
 }
 
 // ── helpers ──
@@ -39,6 +24,21 @@ function getPastConversations(person, otherNames, limit = 2) {
 function formatMemories(person, limit = 6) {
   if (!person.memories?.length) return '';
   return person.memories.slice(-limit).map(m => `[Day ${m.day}] ${m.text}`).join('\n');
+}
+
+// Summarize how the person feels about places based on anchored memories.
+// Informs the LLM without forcing it — the model can still choose to go anywhere.
+function formatPlaceFeelings(person) {
+  if (!person.memories?.length) return '';
+  const byPlace = {};
+  for (const m of person.memories) {
+    if (!m.location || !m.valence) continue;
+    byPlace[m.location] = (byPlace[m.location] || 0) + (m.weight ?? Math.abs(m.valence)) * Math.sign(m.valence);
+  }
+  const lines = Object.entries(byPlace)
+    .filter(([, v]) => Math.abs(v) > 0.5)
+    .map(([place, v]) => `${place}: ${v > 0 ? 'fond of it' : 'uneasy about it'}`);
+  return lines.length ? lines.join(', ') : '';
 }
 
 function formatInventory(person) {
@@ -122,11 +122,10 @@ ${person.children?.length ? `Children: ${person.children.join(', ')}.` : ''}
 YOUR STATE RIGHT NOW:
 Mood: ${person.mood}. ${personContext(person)}
 
-THINK LIKE A REAL HUMAN. Prioritize:
-- Survival first (eat if hungry, sleep if exhausted, seek shelter in storms)
-- Then current projects (if building, gather what you need)
-- Then social needs (seek people if lonely, avoid if overwhelmed)
-- Then long-term goals (learn skills, find partner, explore)
+You're being asked to decide because something INTERESTING is happening — a choice with no obvious answer. Pure survival reflexes (collapsing from exhaustion, eating when starving, fleeing a storm) are handled automatically; don't waste this moment on them. THINK LIKE A REAL HUMAN about what YOU want here:
+- Competing pulls (hungry but also lonely? building but tired? what wins for you right now?)
+- Relationships and feelings (pursue someone, mend a rift, avoid someone, comfort a friend)
+- Your projects and ambitions (push them forward, or let them go)
 - Sometimes just do nothing — sit, think, wander aimlessly. Real people don't optimize every minute.
 
 You can also UPDATE YOUR GOALS if they no longer make sense. Drop goals that feel wrong, add new ones based on what's happened to you.`;
@@ -157,12 +156,13 @@ PLACES YOU CAN GO:
 
 YOUR MEMORIES:
 ${formatMemories(person, 6) || 'Nothing yet — this is all new.'}
+${formatPlaceFeelings(person) ? `\nHOW YOU FEEL ABOUT PLACES: ${formatPlaceFeelings(person)}` : ''}
 
 What do you do? Think step by step as ${person.name}, then decide.
 
 JSON response:
 {
-  "action": "go_to/seek_person/rest/chop_wood/collect_stone/gather_thatch/gather_food/fish/build/hunt/explore/sit_and_think/heal_person/craft/tend_crops",
+  "action": "go_to/seek_person/rest/chop_wood/collect_stone/gather_thatch/gather_food/fish/build/hunt/explore/sit_and_think/heal_person/craft",
   "target": "location name or person name or animal type",
   "reason": "why — one sentence, in first person as ${person.name}",
   "mood": "your mood now",
@@ -170,7 +170,7 @@ JSON response:
   "update_goals": [{"action": "add/drop", "goal": "description"}] or null
 }`;
 
-  return callOpenAI(systemPrompt, userPrompt, 0.9, 400);
+  return callLLM(systemPrompt, userPrompt, 0.9, 400, 'action');
 }
 
 // ── DIALOGUE ──
@@ -235,7 +235,7 @@ JSON:
   "wants_to_continue": true or false
 }`;
 
-  const result = await callOpenAI(systemPrompt, userPrompt, 0.95, 400);
+  const result = await callLLM(systemPrompt, userPrompt, 0.95, 400, 'dialogue');
   if (!result) return null;
   history.push({ speaker: speaker.name, text: result.dialogue, thought: result.internal_thought });
   if (history.length > 30) history.splice(0, history.length - 30);
@@ -271,5 +271,5 @@ JSON:
   "estimated_quality": "crude/basic/decent/good/excellent"
 }`;
 
-  return callOpenAI(systemPrompt, userPrompt, 0.85, 300);
+  return callLLM(systemPrompt, userPrompt, 0.85, 300, 'build');
 }

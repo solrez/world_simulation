@@ -1,4 +1,4 @@
-import { Application, Container, Graphics, Text, TextStyle } from 'pixi.js';
+import { Application, Container, Graphics, Text, TextStyle, BitmapText, BitmapFont } from 'pixi.js';
 import { TILE, MAP_W, MAP_H, TERRAIN, LOCATIONS } from '../utils/constants.js';
 
 const T = TILE;
@@ -12,6 +12,32 @@ const WATER_LIGHT = 0x2a6090;
 const FLOWER_COLS = [0xe85880, 0xeec844, 0xa060d0, 0xe89040, 0x50c8e0, 0xff7090, 0xffaa30];
 const DIRT_COLS = [0x6a5a3e, 0x725f42, 0x5e5236];
 
+// Day/night overlay keyframes {hour, color, alpha}, interpolated continuously.
+const DAYNIGHT_KEYFRAMES = [
+  { hour: 0, color: 0x050818, alpha: 0.55 },  // deep night
+  { hour: 5, color: 0x101830, alpha: 0.45 },  // pre-dawn
+  { hour: 7, color: 0xffcc60, alpha: 0.08 },  // sunrise warm
+  { hour: 10, color: 0xfff0c0, alpha: 0.02 }, // bright day
+  { hour: 14, color: 0xff9040, alpha: 0.03 }, // afternoon
+  { hour: 18, color: 0xff6030, alpha: 0.18 }, // dusk / sunset
+  { hour: 21, color: 0x0a0418, alpha: 0.40 }, // evening
+  { hour: 24, color: 0x050818, alpha: 0.55 }, // wraps to night
+];
+
+const TIME_OF_DAY_HOURS = { night: 0, morning: 7, midday: 11, afternoon: 15, evening: 19 };
+function hourFromTimeOfDay(tod) { return TIME_OF_DAY_HOURS[tod] ?? 12; }
+
+function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+
+function lerpColor(c1, c2, t) {
+  const r1 = (c1 >> 16) & 0xff, g1 = (c1 >> 8) & 0xff, b1 = c1 & 0xff;
+  const r2 = (c2 >> 16) & 0xff, g2 = (c2 >> 8) & 0xff, b2 = c2 & 0xff;
+  const r = Math.round(r1 + (r2 - r1) * t);
+  const g = Math.round(g1 + (g2 - g1) * t);
+  const b = Math.round(b1 + (b2 - b1) * t);
+  return (r << 16) | (g << 8) | b;
+}
+
 export class GameRenderer {
   constructor() {
     this.app = null;
@@ -21,6 +47,9 @@ export class GameRenderer {
     this.decorLayer = new Container();
     this.locationLayer = new Container();
     this.characterLayer = new Container();
+    // villagers AND vertical decor (trees/bushes/rocks) share this layer and
+    // sort by zIndex (feet-baseline Y) so they interleave in a 2.5D way.
+    this.characterLayer.sortableChildren = true;
     this.particleLayer = new Container();
     this.bubbleLayer = new Container();
     this.lightLayer = new Container();
@@ -38,6 +67,9 @@ export class GameRenderer {
     this._particles = [];
     this._trails = [];
     this._timeOfDay = 'morning';
+    // per-entity view caches, keyed by id, for pooling (see updateCharacters)
+    this._charCache = new Map();
+    this._fontReady = false;
   }
 
   async init(container) {
@@ -46,6 +78,19 @@ export class GameRenderer {
     const h = container.clientHeight || 600;
     await this.app.init({ width: w, height: h, backgroundColor: 0x1a3a1a, antialias: false, resolution: 1, autoDensity: true, preference: 'webgl' });
     container.appendChild(this.app.canvas);
+
+    // one white bitmap-font atlas; per-instance tint colors labels, scale sizes them
+    if (!this._fontReady) {
+      BitmapFont.install({
+        name: 'village',
+        style: {
+          fontFamily: 'monospace', fontWeight: 'bold', fontSize: 32,
+          fill: 0xffffff, stroke: { color: 0x000000, width: 4 },
+        },
+        chars: [['a', 'z'], ['A', 'Z'], ['0', '9'], [' ', '~']],
+      });
+      this._fontReady = true;
+    }
     new ResizeObserver(() => {
       const nw = container.clientWidth, nh = container.clientHeight;
       if (nw > 0 && nh > 0) this.app.renderer.resize(nw, nh);
@@ -91,6 +136,21 @@ export class GameRenderer {
     this.world.y = this.viewport.y;
     this.world.scale.set(this.viewport.zoom);
     this._updateParticles();
+    if (this._animFrame % 2 === 0) this._animateWater();
+  }
+
+  _animateWater() {
+    if (!this._waterGfx || !this._waterTiles?.length) return;
+    const f = this._animFrame;
+    this._waterGfx.clear();
+    for (const { tx, ty, seed } of this._waterTiles) {
+      const wy = ty + 6 + (seed % 8) + Math.sin(f * 0.05 + seed) * 1.5;
+      const midY = wy - 2 + Math.sin(f * 0.08 + tx * 0.1) * 1.2;
+      const alpha = 0.18 + 0.1 * (0.5 + 0.5 * Math.sin(f * 0.04 + seed));
+      this._waterGfx.moveTo(tx + 3, wy)
+        .quadraticCurveTo(tx + T / 2, midY, tx + T - 3, wy)
+        .stroke({ color: WATER_LIGHT, width: 1, alpha });
+    }
   }
 
   // ── TERRAIN ──
@@ -98,6 +158,7 @@ export class GameRenderer {
   buildTerrain(terrain) {
     if (this._terrainBuilt) return;
     this._terrainBuilt = true;
+    this._waterTiles = [];
     const g = new Graphics();
 
     for (let y = 0; y < MAP_H; y++) {
@@ -138,12 +199,9 @@ export class GameRenderer {
           }
         } else if (tile.type === TERRAIN.WATER) {
           g.rect(tx, ty, T, T).fill(WATER_BASE);
-          // animated wave hints (static for build, animated in tick)
-          const wy = ty + 6 + (seed % 8);
-          g.moveTo(tx + 3, wy).quadraticCurveTo(tx + T / 2, wy - 2, tx + T - 3, wy)
-            .stroke({ color: WATER_LIGHT, width: 1, alpha: 0.25 });
-          // depth gradient at edges
+          // depth gradient at edges (static); wave hints are animated separately
           g.rect(tx, ty, T, 3).fill({ color: 0x183860, alpha: 0.2 });
+          this._waterTiles.push({ tx, ty, seed });
         } else if (tile.type === TERRAIN.DIRT) {
           g.rect(tx, ty, T, T).fill(DIRT_COLS[seed % DIRT_COLS.length]);
         }
@@ -155,62 +213,80 @@ export class GameRenderer {
     }
 
     this.terrainLayer.addChild(g);
+    // animated wave overlay sits just above the baked terrain
+    this._waterGfx = new Graphics();
+    this.terrainLayer.addChild(this._waterGfx);
     this._buildDecorations(terrain);
     this._buildLocations();
   }
 
   _buildDecorations(terrain) {
-    const g = new Graphics();
+    // flat ground decor (reeds, lilypads) stays in one decorLayer Graphics,
+    // always behind everything in the sorted character layer.
+    const flat = new Graphics();
+
+    // vertical occluders (trees/bushes/rocks) each get their own Graphics in
+    // the sortable characterLayer, keyed by feet-baseline Y so villagers can
+    // pass in front of / behind them.
+    const occluder = (px, py, draw) => {
+      const og = new Graphics();
+      draw(og);
+      og.zIndex = py; // feet baseline; matches character zIndex convention
+      this.characterLayer.addChild(og);
+    };
 
     // detailed trees around grove
     const treeClusters = [
       [4,3],[5,4],[7,3],[8,5],[5,6],[7,6],[4,5],[8,4],[3,4],[9,5],[6,3],[6,7],
     ];
     for (const [tx, ty] of treeClusters) {
-      this._drawTree(g, tx * T + T / 2, ty * T + T / 2, 'large');
+      const px = tx * T + T / 2, py = ty * T + T / 2;
+      occluder(px, py, og => this._drawTree(og, px, py, 'large'));
     }
 
     // scattered trees with variety
     const scattered = [[22,5],[26,10],[2,12],[10,19],[28,3],[1,8],[15,18],[25,19],[12,2],[27,7],[16,3],[3,18],[20,17],[11,7],[18,15]];
     for (const [tx, ty] of scattered) {
       if (tx >= MAP_W || ty >= MAP_H) continue;
-      this._drawTree(g, tx * T + T / 2, ty * T + T / 2, tx % 3 === 0 ? 'pine' : 'small');
+      const px = tx * T + T / 2, py = ty * T + T / 2;
+      occluder(px, py, og => this._drawTree(og, px, py, tx % 3 === 0 ? 'pine' : 'small'));
     }
 
     // rocks near rock seat — mossy boulders
-    this._drawRock(g, 17 * T + 10, 4 * T + 8, 6);
-    this._drawRock(g, 18 * T + 14, 4 * T + 12, 5);
-    this._drawRock(g, 19 * T + 4, 4 * T + 4, 3.5);
+    occluder(17 * T + 10, 4 * T + 8, og => this._drawRock(og, 17 * T + 10, 4 * T + 8, 6));
+    occluder(18 * T + 14, 4 * T + 12, og => this._drawRock(og, 18 * T + 14, 4 * T + 12, 5));
+    occluder(19 * T + 4, 4 * T + 4, og => this._drawRock(og, 19 * T + 4, 4 * T + 4, 3.5));
 
-    // pond reeds and lilypads
+    // pond reeds and lilypads (flat — stay in decorLayer)
     for (let i = 0; i < 8; i++) {
       const rx = 23 * T + i * 4 + 2, ry = 14 * T + (i % 3) * 4;
-      g.moveTo(rx, ry + 10).quadraticCurveTo(rx + 1, ry + 3, rx - 0.5, ry).stroke({ color: 0x4a7a3a, width: 1.2 });
-      g.circle(rx, ry - 1, 2).fill(0x5a8a4a);
+      flat.moveTo(rx, ry + 10).quadraticCurveTo(rx + 1, ry + 3, rx - 0.5, ry).stroke({ color: 0x4a7a3a, width: 1.2 });
+      flat.circle(rx, ry - 1, 2).fill(0x5a8a4a);
     }
-    // lilypads on water
     const pondX = 24 * T, pondY = 15 * T;
     for (let i = 0; i < 4; i++) {
       const lx = pondX + (i * 7) - 5, ly = pondY + (i % 2) * 8 + 4;
-      g.circle(lx, ly, 3).fill({ color: 0x3a7a3a, alpha: 0.7 });
-      g.circle(lx + 0.5, ly - 0.5, 1).fill({ color: 0xff6688, alpha: 0.6 });
+      flat.circle(lx, ly, 3).fill({ color: 0x3a7a3a, alpha: 0.7 });
+      flat.circle(lx + 0.5, ly - 0.5, 1).fill({ color: 0xff6688, alpha: 0.6 });
     }
 
-    // bushes scattered
+    // bushes scattered (vertical occluders)
     const bushes = [[5,10],[10,14],[20,12],[25,6],[3,7],[14,17],[8,3]];
     for (const [bx, by] of bushes) {
       const px = bx * T + T / 2, py = by * T + T / 2;
-      g.circle(px, py, 4).fill(0x2a6a28);
-      g.circle(px + 2, py - 1, 3).fill(0x3a7a34);
-      g.circle(px - 2, py + 1, 3.5).fill(0x2a5a24);
-      // berries
-      if (bx % 2 === 0) {
-        g.circle(px + 1, py - 2, 1).fill(0xcc3344);
-        g.circle(px - 2, py, 1).fill(0xcc3344);
-      }
+      occluder(px, py, og => {
+        og.circle(px, py, 4).fill(0x2a6a28);
+        og.circle(px + 2, py - 1, 3).fill(0x3a7a34);
+        og.circle(px - 2, py + 1, 3.5).fill(0x2a5a24);
+        if (bx % 2 === 0) {
+          og.circle(px + 1, py - 2, 1).fill(0xcc3344);
+          og.circle(px - 2, py, 1).fill(0xcc3344);
+        }
+      });
     }
 
-    this.decorLayer.addChild(g);
+    this.decorLayer.addChild(flat);
+    void terrain;
   }
 
   _drawTree(g, px, py, type) {
@@ -445,188 +521,231 @@ export class GameRenderer {
   // ── CHARACTERS ──
 
   updateCharacters(people) {
-    this.characterLayer.removeChildren();
+    const tick = this._animFrame;
 
     for (const person of people) {
-      if (person.alive === false) {
-        // grave marker
-        const gx = person.x * T + T / 2, gy = person.y * T + T / 2;
-        const g = new Graphics();
-        g.rect(gx - 3, gy - 6, 6, 10).fill(0x5a5a5a);
-        g.rect(gx - 5, gy - 4, 10, 2).fill(0x5a5a5a);
-        this.characterLayer.addChild(g);
-        continue;
+      let view = this._charCache.get(person.id);
+      if (!view) {
+        view = this._makeCharView();
+        this._charCache.set(person.id, view);
+        this.characterLayer.addChild(view.container);
       }
+      view.seen = tick;
 
       const px = person.x * T + T / 2, py = person.y * T + T / 2;
-      const g = new Graphics();
+      view.container.x = px;
+      view.container.y = py;
+      view.container.zIndex = py; // feet-baseline depth: lower on screen = in front
+
+      // signature: redraw geometry only when something visible changes. The
+      // quantized walk phase makes a walking villager redraw a few times per
+      // cycle (faithful limb swing) instead of every frame.
+      const s = person.lifeStage === 'baby' ? 0.45 : person.lifeStage === 'child' ? 0.65
+        : person.lifeStage === 'teen' ? 0.85 : 1;
       const isSleeping = person.sleeping;
       const isEating = person.eating;
       const isConversing = !!person.conversationId;
-      const isBaby = person.lifeStage === 'baby';
-      const isChild = person.lifeStage === 'child';
-      const isTeen = person.lifeStage === 'teen';
-      const s = isBaby ? 0.45 : isChild ? 0.65 : isTeen ? 0.85 : 1;
+      const moving = !isSleeping && !isConversing && !isEating;
+      const walkPhase = moving ? Math.round(Math.sin(tick * 0.1 + person.id * 2.5) * 4) : 0;
+      const sig = [
+        person.alive === false, person.lifeStage, person.gender, person.color, person.mood,
+        isSleeping, isEating, isConversing, !!person.partner, person.pregnant,
+        person.hunger > 60, person.tiredness > 70, walkPhase,
+      ].join('|');
 
-      // shadow
-      g.ellipse(px, py + 10 * s, 5 * s, 2.5 * s).fill({ color: 0x000000, alpha: 0.18 });
-
-      if (isSleeping) {
-        // lying down — curved body
-        g.roundRect(px - 9 * s, py + 1, 18 * s, 7 * s, 3).fill(person.color);
-        g.circle(px - 7 * s, py - 1, 4.5 * s).fill(0xe0c098);
-        // hair on head while lying
-        const hc = this._hairColor(person);
-        g.circle(px - 7 * s, py - 3 * s, 4 * s).fill(hc);
-        // closed eyes
-        g.moveTo(px - 9 * s, py - 1).lineTo(px - 6 * s, py - 1).stroke({ color: 0x2a2a2a, width: 0.7 });
-        // blanket
-        g.roundRect(px - 5 * s, py + 1, 14 * s, 7 * s, 2).fill({ color: person.color, alpha: 0.5 });
-      } else {
-        const walk = isConversing || isEating ? 0 : Math.sin(this._animFrame * 0.1 + person.id * 2.5) * 2.5;
-        const bob = Math.abs(walk) * 0.3;
-
-        // feet/shoes
-        const shoeColor = 0x4a3828;
-        g.roundRect(px - 3.5 * s, py + 6 * s + walk * 0.2, 3 * s, 3 * s, 1).fill(shoeColor);
-        g.roundRect(px + 0.5 * s, py + 6 * s - walk * 0.2, 3 * s, 3 * s, 1).fill(shoeColor);
-
-        // legs
-        g.rect(px - 3 * s, py + 2 * s, 2.5 * s, (5 + walk * 0.2) * s).fill(0x4a4a5a);
-        g.rect(px + 0.5 * s, py + 2 * s, 2.5 * s, (5 - walk * 0.2) * s).fill(0x4a4a5a);
-
-        // body — more detailed torso
-        g.roundRect(px - 5.5 * s, py - 5 * s - bob, 11 * s, 11 * s, 3).fill(person.color);
-        // clothing detail — belt/collar
-        g.rect(px - 5 * s, py + 3 * s - bob, 10 * s, 1.5 * s).fill({ color: 0x000000, alpha: 0.15 });
-        g.rect(px - 3 * s, py - 5 * s - bob, 6 * s, 2 * s).fill({ color: 0xffffff, alpha: 0.08 }); // collar
-
-        // arms
-        const armSwing = walk * 0.4;
-        g.roundRect(px - 7 * s, py - 2 * s - bob + armSwing, 2.5 * s, 7 * s, 1).fill(person.color);
-        g.roundRect(px + 4.5 * s, py - 2 * s - bob - armSwing, 2.5 * s, 7 * s, 1).fill(person.color);
-        // hands
-        g.circle(px - 6 * s, py + 5 * s + armSwing, 1.5 * s).fill(0xe0c098);
-        g.circle(px + 6 * s, py + 5 * s - armSwing, 1.5 * s).fill(0xe0c098);
-
-        // pregnant belly
-        if (person.pregnant) {
-          g.circle(px, py + 1 * s - bob, 4.5 * s).fill({ color: 0xffeedd, alpha: 0.5 });
-        }
-
-        // head
-        g.circle(px, py - 9 * s - bob, 5.5 * s).fill(0xe0c098);
-        // ears
-        g.circle(px - 5 * s, py - 9 * s - bob, 1.5 * s).fill(0xd8b888);
-        g.circle(px + 5 * s, py - 9 * s - bob, 1.5 * s).fill(0xd8b888);
-
-        // hair
-        const hc = this._hairColor(person);
-        if (person.gender === 'female') {
-          g.circle(px, py - 11 * s - bob, 5.5 * s).fill(hc);
-          // long hair sides
-          g.roundRect(px - 6 * s, py - 11 * s - bob, 2.5 * s, 8 * s, 1).fill(hc);
-          g.roundRect(px + 3.5 * s, py - 11 * s - bob, 2.5 * s, 8 * s, 1).fill(hc);
-          // bangs
-          g.rect(px - 4 * s, py - 14 * s - bob, 8 * s, 3 * s).fill(hc);
-        } else {
-          g.rect(px - 5 * s, py - 15 * s - bob, 10 * s, 6 * s).fill(hc);
-          g.rect(px - 4.5 * s, py - 14 * s - bob, 9 * s, 4 * s).fill(hc);
-        }
-
-        // eyes
-        const eyeY = py - 9 * s - bob;
-        if (isEating) {
-          g.moveTo(px - 3 * s, eyeY).lineTo(px - 1 * s, eyeY).stroke({ color: 0x2a2a2a, width: 0.8 });
-          g.moveTo(px + 1 * s, eyeY).lineTo(px + 3 * s, eyeY).stroke({ color: 0x2a2a2a, width: 0.8 });
-        } else {
-          // eye whites
-          g.circle(px - 2.2 * s, eyeY, 1.8 * s).fill(0xffffff);
-          g.circle(px + 2.2 * s, eyeY, 1.8 * s).fill(0xffffff);
-          // pupils
-          g.circle(px - 2 * s, eyeY + 0.3, 1 * s).fill(0x2a2a2a);
-          g.circle(px + 2.4 * s, eyeY + 0.3, 1 * s).fill(0x2a2a2a);
-          // eye shine
-          g.circle(px - 1.5 * s, eyeY - 0.3, 0.4 * s).fill(0xffffff);
-          g.circle(px + 2.9 * s, eyeY - 0.3, 0.4 * s).fill(0xffffff);
-        }
-
-        // eyebrows (mood-based)
-        const browY = eyeY - 2.5 * s;
-        if (person.mood === 'annoyed' || person.mood === 'jealous') {
-          g.moveTo(px - 4 * s, browY - 1).lineTo(px - 1 * s, browY + 0.5).stroke({ color: 0x3a2a1a, width: 1 });
-          g.moveTo(px + 1 * s, browY + 0.5).lineTo(px + 4 * s, browY - 1).stroke({ color: 0x3a2a1a, width: 1 });
-        } else if (person.mood === 'sad' || person.mood === 'heartbroken') {
-          g.moveTo(px - 4 * s, browY + 0.5).lineTo(px - 1 * s, browY - 0.5).stroke({ color: 0x3a2a1a, width: 0.8 });
-          g.moveTo(px + 1 * s, browY - 0.5).lineTo(px + 4 * s, browY + 0.5).stroke({ color: 0x3a2a1a, width: 0.8 });
-        }
-
-        // mouth
-        this._drawMouth(g, px, py - 6 * s - bob, s, person.mood);
+      if (view.sig !== sig) {
+        view.sig = sig;
+        this._drawCharBody(view.body, person, s, walkPhase, tick);
+        this._drawNeeds(view.needs, person, s);
+        this._updateNameLabel(view, person, s);
       }
 
-      // partner indicator
+      // per-frame cheap bits: pulse indicators + zzz + emote
+      this._animateCharOverlay(view, person, s, tick);
+    }
+
+    // sweep entities that disappeared (deaths handled in-place via the 'alive'
+    // signature; this only removes people no longer in the list)
+    for (const [id, view] of this._charCache) {
+      if (view.seen !== tick) {
+        view.container.destroy({ children: true });
+        this._charCache.delete(id);
+      }
+    }
+  }
+
+  _makeCharView() {
+    const container = new Container();
+    const body = new Graphics();
+    const needs = new Graphics();
+    const overlay = new Graphics(); // pulse/convo indicators, animated each frame
+    const name = new BitmapText({ text: '', style: { fontFamily: 'village', fontSize: 32 } });
+    name.anchor.set(0.5, 0);
+    const zzz = [0, 1, 2].map(() => {
+      const z = new BitmapText({ text: 'Z', style: { fontFamily: 'village', fontSize: 32 } });
+      z.anchor.set(0.5);
+      z.tint = 0x8888cc;
+      z.visible = false;
+      return z;
+    });
+    container.addChild(body, needs, overlay, name, ...zzz);
+    return { container, body, needs, overlay, name, zzz, sig: null, nameText: null, nameScale: null };
+  }
+
+  // Draw the villager body in LOCAL coordinates around (0,0); the container is
+  // positioned at the world point, so movement is a transform, not a redraw.
+  _drawCharBody(g, person, s, walkPhase, tick) {
+    g.clear();
+    const isSleeping = person.sleeping;
+    const isEating = person.eating;
+
+    if (person.alive === false) {
+      // gravestone
+      g.rect(-3, -6, 6, 10).fill(0x5a5a5a);
+      g.rect(-5, -4, 10, 2).fill(0x5a5a5a);
+      return;
+    }
+
+    // shadow
+    g.ellipse(0, 10 * s, 5 * s, 2.5 * s).fill({ color: 0x000000, alpha: 0.18 });
+
+    if (isSleeping) {
+      g.roundRect(-9 * s, 1, 18 * s, 7 * s, 3).fill(person.color);
+      g.circle(-7 * s, -1, 4.5 * s).fill(0xe0c098);
+      const hc = this._hairColor(person);
+      g.circle(-7 * s, -3 * s, 4 * s).fill(hc);
+      g.moveTo(-9 * s, -1).lineTo(-6 * s, -1).stroke({ color: 0x2a2a2a, width: 0.7 });
+      g.roundRect(-5 * s, 1, 14 * s, 7 * s, 2).fill({ color: person.color, alpha: 0.5 });
+      return;
+    }
+
+    // reconstruct limb swing from the quantized phase (faithful walk)
+    const walk = (isEating ? 0 : walkPhase / 4 * 2.5);
+    const bob = Math.abs(walk) * 0.3;
+
+    const shoeColor = 0x4a3828;
+    g.roundRect(-3.5 * s, 6 * s + walk * 0.2, 3 * s, 3 * s, 1).fill(shoeColor);
+    g.roundRect(0.5 * s, 6 * s - walk * 0.2, 3 * s, 3 * s, 1).fill(shoeColor);
+
+    g.rect(-3 * s, 2 * s, 2.5 * s, (5 + walk * 0.2) * s).fill(0x4a4a5a);
+    g.rect(0.5 * s, 2 * s, 2.5 * s, (5 - walk * 0.2) * s).fill(0x4a4a5a);
+
+    g.roundRect(-5.5 * s, -5 * s - bob, 11 * s, 11 * s, 3).fill(person.color);
+    g.rect(-5 * s, 3 * s - bob, 10 * s, 1.5 * s).fill({ color: 0x000000, alpha: 0.15 });
+    g.rect(-3 * s, -5 * s - bob, 6 * s, 2 * s).fill({ color: 0xffffff, alpha: 0.08 });
+
+    const armSwing = walk * 0.4;
+    g.roundRect(-7 * s, -2 * s - bob + armSwing, 2.5 * s, 7 * s, 1).fill(person.color);
+    g.roundRect(4.5 * s, -2 * s - bob - armSwing, 2.5 * s, 7 * s, 1).fill(person.color);
+    g.circle(-6 * s, 5 * s + armSwing, 1.5 * s).fill(0xe0c098);
+    g.circle(6 * s, 5 * s - armSwing, 1.5 * s).fill(0xe0c098);
+
+    if (person.pregnant) g.circle(0, 1 * s - bob, 4.5 * s).fill({ color: 0xffeedd, alpha: 0.5 });
+
+    g.circle(0, -9 * s - bob, 5.5 * s).fill(0xe0c098);
+    g.circle(-5 * s, -9 * s - bob, 1.5 * s).fill(0xd8b888);
+    g.circle(5 * s, -9 * s - bob, 1.5 * s).fill(0xd8b888);
+
+    const hc = this._hairColor(person);
+    if (person.gender === 'female') {
+      g.circle(0, -11 * s - bob, 5.5 * s).fill(hc);
+      g.roundRect(-6 * s, -11 * s - bob, 2.5 * s, 8 * s, 1).fill(hc);
+      g.roundRect(3.5 * s, -11 * s - bob, 2.5 * s, 8 * s, 1).fill(hc);
+      g.rect(-4 * s, -14 * s - bob, 8 * s, 3 * s).fill(hc);
+    } else {
+      g.rect(-5 * s, -15 * s - bob, 10 * s, 6 * s).fill(hc);
+      g.rect(-4.5 * s, -14 * s - bob, 9 * s, 4 * s).fill(hc);
+    }
+
+    const eyeY = -9 * s - bob;
+    if (isEating) {
+      g.moveTo(-3 * s, eyeY).lineTo(-1 * s, eyeY).stroke({ color: 0x2a2a2a, width: 0.8 });
+      g.moveTo(1 * s, eyeY).lineTo(3 * s, eyeY).stroke({ color: 0x2a2a2a, width: 0.8 });
+    } else {
+      g.circle(-2.2 * s, eyeY, 1.8 * s).fill(0xffffff);
+      g.circle(2.2 * s, eyeY, 1.8 * s).fill(0xffffff);
+      g.circle(-2 * s, eyeY + 0.3, 1 * s).fill(0x2a2a2a);
+      g.circle(2.4 * s, eyeY + 0.3, 1 * s).fill(0x2a2a2a);
+      g.circle(-1.5 * s, eyeY - 0.3, 0.4 * s).fill(0xffffff);
+      g.circle(2.9 * s, eyeY - 0.3, 0.4 * s).fill(0xffffff);
+    }
+
+    const browY = eyeY - 2.5 * s;
+    if (person.mood === 'annoyed' || person.mood === 'jealous') {
+      g.moveTo(-4 * s, browY - 1).lineTo(-1 * s, browY + 0.5).stroke({ color: 0x3a2a1a, width: 1 });
+      g.moveTo(1 * s, browY + 0.5).lineTo(4 * s, browY - 1).stroke({ color: 0x3a2a1a, width: 1 });
+    } else if (person.mood === 'sad' || person.mood === 'heartbroken') {
+      g.moveTo(-4 * s, browY + 0.5).lineTo(-1 * s, browY - 0.5).stroke({ color: 0x3a2a1a, width: 0.8 });
+      g.moveTo(1 * s, browY - 0.5).lineTo(4 * s, browY + 0.5).stroke({ color: 0x3a2a1a, width: 0.8 });
+    }
+
+    this._drawMouth(g, 0, -6 * s - bob, s, person.mood);
+    void tick;
+  }
+
+  _drawNeeds(g, person, s) {
+    g.clear();
+    if (person.alive === false || person.sleeping) return;
+    if (!(person.hunger > 60 || person.tiredness > 70)) return;
+    const barY = 16 * s;
+    if (person.hunger > 60) {
+      g.roundRect(-9, barY, 18, 3, 1).fill(0x222222);
+      g.roundRect(-9, barY, 18 * (1 - person.hunger / 100), 3, 1).fill(0xe08040);
+    }
+    if (person.tiredness > 70) {
+      g.roundRect(-9, barY + 4, 18, 3, 1).fill(0x222222);
+      g.roundRect(-9, barY + 4, 18 * (1 - person.tiredness / 100), 3, 1).fill(0x6060c0);
+    }
+  }
+
+  _updateNameLabel(view, person, s) {
+    const isBaby = person.lifeStage === 'baby';
+    const isChild = person.lifeStage === 'child';
+    const fontPx = isBaby ? 5 : isChild ? 6 : 7;
+    if (view.nameText !== person.name) { view.name.text = person.name; view.nameText = person.name; }
+    view.name.tint = person.color;
+    view.name.scale.set(fontPx / 32); // atlas is rasterized at 32px
+    view.name.x = 0;
+    view.name.y = person.sleeping ? 10 : 13 * s;
+    view.name.visible = person.alive !== false;
+  }
+
+  _animateCharOverlay(view, person, s, tick) {
+    const g = view.overlay;
+    g.clear();
+    const dead = person.alive === false;
+    const isSleeping = person.sleeping;
+
+    // pulse indicators
+    if (!dead) {
       if (person.partner && !isSleeping) {
-        const pulse = Math.sin(this._animFrame * 0.06 + person.id) * 0.3 + 0.7;
-        g.circle(px + 8 * s, py - 14 * s, 2.5).fill({ color: 0xff4466, alpha: pulse * 0.5 });
+        const pulse = Math.sin(tick * 0.06 + person.id) * 0.3 + 0.7;
+        g.circle(8 * s, -14 * s, 2.5).fill({ color: 0xff4466, alpha: pulse * 0.5 });
       }
-
-      // convo indicator
-      if (isConversing && !isSleeping) {
-        const pulse = Math.sin(this._animFrame * 0.12) * 0.3 + 0.7;
-        g.circle(px, py - 18 * s, 2.5).fill({ color: 0xffdd44, alpha: pulse });
+      if (person.conversationId && !isSleeping) {
+        const pulse = Math.sin(tick * 0.12) * 0.3 + 0.7;
+        g.circle(0, -18 * s, 2.5).fill({ color: 0xffdd44, alpha: pulse });
       }
+    }
 
-      this.characterLayer.addChild(g);
-
-      // emotes
-      if (person.emote && !isSleeping) this._drawEmote(px, py - 20 * s, person.emote);
-
-      // zzz
-      if (isSleeping) {
-        const bob = Math.sin(this._animFrame * 0.05 + person.id) * 3;
-        const sizes = [7, 8, 9];
-        for (let zi = 0; zi < 3; zi++) {
-          const zz = new Text({
-            text: 'Z',
-            style: new TextStyle({ fontSize: sizes[zi], fill: 0x8888cc, fontFamily: 'monospace', fontWeight: 'bold', stroke: { color: 0x000000, width: 1 } }),
-          });
-          zz.anchor.set(0.5);
-          zz.x = px + 8 + zi * 5;
-          zz.y = py - 6 + bob - zi * 6;
-          zz.alpha = 0.8 - zi * 0.15;
-          this.characterLayer.addChild(zz);
-        }
+    // zzz (pooled BitmapText) — toggle + animate, no recreation
+    const showZ = isSleeping && !dead;
+    const zb = Math.sin(tick * 0.05 + person.id) * 3;
+    const zSizes = [7, 8, 9];
+    for (let zi = 0; zi < 3; zi++) {
+      const z = view.zzz[zi];
+      z.visible = showZ;
+      if (showZ) {
+        z.scale.set(zSizes[zi] / 32);
+        z.x = 8 + zi * 5;
+        z.y = -6 + zb - zi * 6;
+        z.alpha = 0.8 - zi * 0.15;
       }
+    }
 
-      // name
-      const nameLabel = new Text({
-        text: person.name,
-        style: new TextStyle({
-          fontSize: isBaby ? 5 : isChild ? 6 : 7,
-          fill: person.color, fontFamily: 'monospace', fontWeight: 'bold',
-          stroke: { color: 0x000000, width: 2 },
-        }),
-      });
-      nameLabel.anchor.set(0.5, 0);
-      nameLabel.x = px;
-      nameLabel.y = py + (isSleeping ? 10 : 13 * s);
-      this.characterLayer.addChild(nameLabel);
-
-      // needs bars
-      if (!isSleeping && (person.hunger > 60 || person.tiredness > 70)) {
-        const bg = new Graphics();
-        const barY = py + 16 * s;
-        if (person.hunger > 60) {
-          bg.roundRect(px - 9, barY, 18, 3, 1).fill(0x222222);
-          bg.roundRect(px - 9, barY, 18 * (1 - person.hunger / 100), 3, 1).fill(0xe08040);
-        }
-        if (person.tiredness > 70) {
-          bg.roundRect(px - 9, barY + 4, 18, 3, 1).fill(0x222222);
-          bg.roundRect(px - 9, barY + 4, 18 * (1 - person.tiredness / 100), 3, 1).fill(0x6060c0);
-        }
-        this.characterLayer.addChild(bg);
-      }
+    // emotes still draw into the per-frame particle layer at world position
+    if (person.emote && !isSleeping && !dead) {
+      this._drawEmote(view.container.x, view.container.y - 20 * s, person.emote);
     }
   }
 
@@ -816,14 +935,22 @@ export class GameRenderer {
   // ── WILDLIFE ──
 
   updateWildlife(wildlife) {
-    if (this._wildlifeGfx) this.characterLayer.removeChild(this._wildlifeGfx);
+    // animals live directly in the sortable characterLayer so each depth-sorts
+    // individually against trees and villagers by feet-baseline Y.
+    if (this._wildlifeGfxs) {
+      for (const wg of this._wildlifeGfxs) { this.characterLayer.removeChild(wg); wg.destroy(); }
+    }
+    this._wildlifeGfxs = [];
     if (!wildlife?.length) return;
-    const g = new Graphics();
 
     for (const animal of wildlife) {
       if (!animal.alive) continue;
       const ax = animal.x * T + T / 2, ay = animal.y * T + T / 2;
       const bob = Math.sin(this._animFrame * 0.06 + animal.id) * 1;
+      const g = new Graphics();
+      g.zIndex = ay; // feet-baseline depth, same convention as characters
+      this._wildlifeGfxs.push(g);
+      this.characterLayer.addChild(g);
 
       // shadow
       g.ellipse(ax, ay + 6, 4, 2).fill({ color: 0x000000, alpha: 0.12 });
@@ -888,9 +1015,6 @@ export class GameRenderer {
         g.circle(ax, ay - 12, 2).fill({ color: 0x60c060, alpha: 0.6 });
       }
     }
-
-    this._wildlifeGfx = g;
-    this.characterLayer.addChild(g);
   }
 
   // ── CAMPFIRE ──
@@ -936,26 +1060,29 @@ export class GameRenderer {
 
   // ── DAY/NIGHT ──
 
-  updateDayNight(timeOfDay) {
+  updateDayNight(timeOfDay, hourFloat) {
     this._timeOfDay = timeOfDay;
+    // Continuous keyframes across the day; the overlay lerps between them so
+    // the tint glides instead of snapping at hour boundaries.
+    const KF = DAYNIGHT_KEYFRAMES;
+    const h = hourFloat == null ? hourFromTimeOfDay(timeOfDay) : ((hourFloat % 24) + 24) % 24;
+    let a = KF[KF.length - 1], b = KF[0];
+    for (let i = 0; i < KF.length - 1; i++) {
+      if (h >= KF[i].hour && h < KF[i + 1].hour) { a = KF[i]; b = KF[i + 1]; break; }
+    }
+    const span = (b.hour - a.hour + 24) % 24 || 24;
+    const t = clamp01(((h - a.hour + 24) % 24) / span);
+    const color = lerpColor(a.color, b.color, t);
+    const alpha = a.alpha + (b.alpha - a.alpha) * t;
+    // night-ness drives the warm campfire glow (smoothstep of how dark it is)
+    const nightness = clamp01((alpha - 0.1) / 0.45);
+
     this.overlayLayer.removeChildren();
     const g = new Graphics();
-    switch (timeOfDay) {
-      case 'night':
-        g.rect(0, 0, MW, MH).fill({ color: 0x050818, alpha: 0.55 });
-        // campfire warm glow at night
-        g.circle(LOCATIONS.CAMPFIRE.x * T + T / 2, LOCATIONS.CAMPFIRE.y * T + T / 2, 90).fill({ color: 0xff8800, alpha: 0.06 });
-        break;
-      case 'evening':
-        g.rect(0, 0, MW, MH).fill({ color: 0x0a0418, alpha: 0.28 });
-        g.rect(0, 0, MW, MH).fill({ color: 0xff6030, alpha: 0.04 }); // sunset tint
-        break;
-      case 'morning':
-        g.rect(0, 0, MW, MH).fill({ color: 0xffcc60, alpha: 0.05 });
-        break;
-      case 'afternoon':
-        g.rect(0, 0, MW, MH).fill({ color: 0xff9040, alpha: 0.03 });
-        break;
+    g.rect(0, 0, MW, MH).fill({ color, alpha });
+    if (nightness > 0.01) {
+      g.circle(LOCATIONS.CAMPFIRE.x * T + T / 2, LOCATIONS.CAMPFIRE.y * T + T / 2, 90)
+        .fill({ color: 0xff8800, alpha: 0.06 * nightness });
     }
     this.overlayLayer.addChild(g);
   }

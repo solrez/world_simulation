@@ -110,6 +110,46 @@ export const MOOD_LOCATIONS = {
   loving: ['Meadow', 'Campfire'],
 };
 
+// Emotional valence for each memory type. Positive = good memory (draws a
+// person toward where it happened), negative = bad (pushes them away). Call
+// sites can override with an explicit valence for type-ambiguous events.
+export const MEMORY_VALENCE = {
+  danger: -3,
+  death: -3,
+  conflict: -1.5,
+  illness: -1,
+  kindness: 1.5,
+  achievement: 2,
+  ambition: 2,
+  life: 0.5,
+  conversation: 0,
+};
+
+// Memory weight decays exponentially. Bad memories fade slower than good ones
+// (trauma lingers), so aversions stay meaningful longer than fond pulls.
+export const MEMORY_HALF_LIFE_GOOD = 4; // days
+export const MEMORY_HALF_LIFE_BAD = 8; // days
+// Below this decayed weight a memory is dropped entirely.
+export const MEMORY_MIN_WEIGHT = 0.05;
+// How sharply location valence skews the engine's own random location picks.
+export const MEMORY_LOCATION_SENSITIVITY = 0.4;
+
+// Escalation gate tunables. Reflexes (one-answer survival) are handled locally;
+// "interesting" situations escalate to the LLM, which keeps all character/social
+// /goal decisions. Thresholds seeded near the old needs-driven values.
+export const GATE = {
+  EXHAUSTED: 80,       // tiredness -> sleep reflex
+  NIGHT_TIRED: 35,     // night + this tired -> sleep reflex
+  STARVING: 70,        // hunger -> eat reflex (mid-hunger 40-70 is LLM territory)
+  SICK_TIRED: 30,      // sick + this tired -> rest reflex
+  ESCALATE_COOLDOWN: 30, // ticks to suppress re-escalation after an LLM call
+  // competing-desire bands that make a situation "interesting"
+  HUNGER_BAND: [40, 70],
+  TIRED_BAND: [40, 80],
+  LONELY_MID: 40,
+  JEALOUSY_LIVE: 40,
+};
+
 export const CHILD_NAMES = {
   male: ['Ash', 'Cedar', 'Lark', 'Reed', 'Sage', 'Wren', 'Birch', 'Flint', 'Moss', 'Clay'],
   female: ['Ivy', 'Luna', 'Fern', 'Hazel', 'Lily', 'Willa', 'Delia', 'Maeve', 'Nora', 'Thea'],
