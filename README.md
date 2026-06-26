@@ -1,16 +1,39 @@
-# React + Vite
+# World Simulation — village-life
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A village life simulation built with React, Vite, and PixiJS. Agents
+converse and act over time; the dev server persists conversation logs and
+world-state snapshots to `data/` locally.
 
-Currently, two official plugins are available:
+## Getting started
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```bash
+npm install
+cp .env.example .env   # then add your own OpenAI API key
+npm run dev
+```
 
-## React Compiler
+Open the printed local URL (default Vite port) in your browser.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Configuration
 
-## Expanding the ESLint configuration
+The simulation calls the OpenAI API. Provide a key in `.env`:
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+```
+VITE_OPENAI_API_KEY=sk-...
+```
+
+`.env` is gitignored and is never committed.
+
+## Security notes
+
+This is a local/experimental project. Be aware of the following before
+deploying it anywhere public — see [SECURITY.md](./SECURITY.md) for details:
+
+- **The API key is client-side.** Vite inlines `VITE_`-prefixed variables
+  into the browser bundle at build time, so any deployed build exposes your
+  key to end users. Use your own key locally; do **not** host a public build
+  with a key you care about. A backend proxy is required to use this safely
+  in production.
+- **The dev server write endpoints are local-only.** The `/api/save-*`
+  routes in `vite.config.js` run only under `vite dev`. Don't expose your
+  dev server to untrusted networks.
