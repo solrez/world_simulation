@@ -1,4 +1,5 @@
 import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, SKILLS, AMBIENT_EVENTS, BUILD_REQUIREMENTS, BUILD_PHASES, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE } from '../utils/constants.js';
+import { buildWalkableGrid, findPath, nearestWalkable } from './pathfinding.js';
 import { generateGroupDialogue, generateAction } from './ai.js';
 
 // ── Conversation Archive (persisted to localStorage) ──
@@ -185,6 +186,7 @@ function initPerson(config, index, startX, startY) {
     x: startX ?? (cf.x + Math.cos(angle) * dist),
     y: startY ?? (cf.y + Math.sin(angle) * dist),
     targetX: null, targetY: null,
+    path: null, _pathDest: null,
     currentLocation: 'village',
     lifeStage: getLifeStage(config.age),
     mood: 'neutral',
@@ -426,13 +428,49 @@ function locationAt(x, y) {
 }
 function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 
-function moveToward(person, tx, ty) {
-  const dx = tx - person.x, dy = ty - person.y;
-  const dist = Math.sqrt(dx * dx + dy * dy);
-  if (dist < 0.5) { person.targetX = null; person.targetY = null; return true; }
+// Walkable grid is cached per simulation state and (re)built when terrain or
+// the building set changes. Movement routes around water via A*.
+function getWalkableGrid(state) {
+  if (!state._walkGrid) state._walkGrid = buildWalkableGrid(state.terrain);
+  return state._walkGrid;
+}
+
+function moveToward(person, tx, ty, state) {
+  const dist = Math.sqrt((tx - person.x) ** 2 + (ty - person.y) ** 2);
+  if (dist < 0.5) { person.targetX = null; person.targetY = null; person.path = null; return true; }
   const spd = person.tiredness > 80 ? person.speed * 0.7 : person.speed;
-  person.x += (dx / dist) * spd;
-  person.y += (dy / dist) * spd;
+
+  // (Re)compute an A* path when the destination changes. Without a state/grid
+  // (e.g. legacy callers) fall back to straight-line movement.
+  const grid = state ? getWalkableGrid(state) : null;
+  if (grid) {
+    const destKey = `${Math.round(tx)},${Math.round(ty)}`;
+    if (person._pathDest !== destKey) {
+      person._pathDest = destKey;
+      person.path = findPath(grid, { x: person.x, y: person.y }, { x: tx, y: ty });
+    }
+    if (person.path && person.path.length) {
+      // steer toward the next waypoint tile centre; pop it once reached
+      const wp = person.path[0];
+      const wdx = wp.x - person.x, wdy = wp.y - person.y;
+      const wd = Math.sqrt(wdx * wdx + wdy * wdy);
+      if (wd < 0.4) { person.path.shift(); return false; }
+      person.x += (wdx / wd) * spd;
+      person.y += (wdy / wd) * spd;
+      return false;
+    }
+    // path is empty (already at goal tile) or null (unreachable) → home in on the
+    // exact target, but only across walkable ground.
+  }
+
+  // final approach / fallback: straight line toward the exact target
+  const dx = tx - person.x, dy = ty - person.y;
+  const nx = person.x + (dx / dist) * spd, ny = person.y + (dy / dist) * spd;
+  if (!grid || nearestWalkable(grid, nx, ny)) {
+    // only step if the destination tile is walkable (or no grid available)
+    const tileWalkable = !grid || grid[Math.round(ny)]?.[Math.round(nx)];
+    if (tileWalkable) { person.x = nx; person.y = ny; }
+  }
   return false;
 }
 
@@ -946,8 +984,9 @@ function processLifeEvents(person, people, state) {
     const mn = bp.materialsNeeded || { wood: 5, stone: 2, thatch: 2 };
     const hasEnough = inv.wood >= mn.wood && inv.stone >= mn.stone && inv.thatch >= mn.thatch;
 
-    if (hasEnough && person.currentLocation === 'village' && distBetween(person, { x: bp.site.x, y: bp.site.y }) < 3) {
-      // at build site with materials — advance construction
+    if (hasEnough && distBetween(person, { x: bp.site.x, y: bp.site.y }) < 3) {
+      // at build site with materials — advance construction (proximity to the
+      // site is what matters, not the named location under their feet)
       bp.progress = (bp.progress || 0) + 1 + (person.skills.building || 0) * 0.02;
       person.activity = 'building';
       person.skills.building = Math.min(100, (person.skills.building || 0) + 0.05);
@@ -1156,7 +1195,7 @@ export function simulateTick(state) {
     }
 
     if (person.targetX !== null) {
-      const arrived = moveToward(person, person.targetX, person.targetY);
+      const arrived = moveToward(person, person.targetX, person.targetY, next);
       if (arrived) {
         person.currentLocation = locationAt(person.x, person.y);
         person.idle = 0;
@@ -2016,7 +2055,11 @@ async function startBuildProject(person, state) {
 
   const hx = LOCATIONS.CAMPFIRE.x + (Math.random() - 0.5) * 14;
   const hy = LOCATIONS.CAMPFIRE.y + (Math.random() - 0.5) * 10;
-  const site = { x: clamp(hx, 3, MAP_W - 4), y: clamp(hy, 3, MAP_H - 4) };
+  // snap to dry, walkable land so homes never spawn in water
+  const grid = getWalkableGrid(state);
+  const dry = nearestWalkable(grid, clamp(hx, 3, MAP_W - 4), clamp(hy, 3, MAP_H - 4))
+    || { x: LOCATIONS.CAMPFIRE.x, y: LOCATIONS.CAMPFIRE.y };
+  const site = { x: dry.x, y: dry.y };
 
   person.buildProject = {
     type: plan.type || 'shelter',
