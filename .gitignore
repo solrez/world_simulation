@@ -27,6 +27,9 @@ data/world_state_*.json
 village_conversations_*.json
 village_world_*.json
 
+# Internal design docs — keep local, never commit
+DESIGN_adaptive_world.md
+
 # Local editor / tooling config
 .claude
 

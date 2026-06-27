@@ -237,13 +237,19 @@ export class GameRenderer {
       this.characterLayer.addChild(og);
     };
 
-    // detailed trees around grove
+    // detailed trees around grove — kept in a list so the grove can visibly thin
+    // as it's chopped (updateEnvironment fades/hides them by patch level).
+    this._groveTrees = [];
     const treeClusters = [
       [4,3],[5,4],[7,3],[8,5],[5,6],[7,6],[4,5],[8,4],[3,4],[9,5],[6,3],[6,7],
     ];
     for (const [tx, ty] of treeClusters) {
       const px = tx * T + T / 2, py = ty * T + T / 2;
-      occluder(px, py, og => this._drawTree(og, px, py, 'large'));
+      const og = new Graphics();
+      this._drawTree(og, px, py, 'large');
+      og.zIndex = py;
+      this.characterLayer.addChild(og);
+      this._groveTrees.push(og);
     }
 
     // scattered trees with variety
@@ -357,16 +363,17 @@ export class GameRenderer {
     // bucket
     g.rect(wx + 3, wy - 10, 3, 4).fill(0x6a5a40);
 
-    // berry bush marker
+    // berry bush marker — the foliage is static; the berries themselves live in
+    // their own graphic so updateEnvironment can thin them as the patch depletes.
     const bb = LOCATIONS.BERRY_BUSH;
     const bbx = bb.x * T + T / 2, bby = bb.y * T + T / 2;
     g.circle(bbx, bby, 6).fill(0x2a6a28);
     g.circle(bbx - 2, bby + 2, 5).fill(0x347a30);
     g.circle(bbx + 3, bby, 5).fill(0x2a5a24);
-    for (let i = 0; i < 6; i++) {
-      const bax = bbx + Math.cos(i * 1.1) * 4, bay = bby + Math.sin(i * 1.4) * 3;
-      g.circle(bax, bay, 1.2).fill(0xcc2244);
-    }
+    this._berryGfx = new Graphics();
+    this._berryPos = bb;
+    this._drawBerries(1);
+    this.locationLayer.addChild(this._berryGfx);
 
     // fishing spot — dock
     const fs = LOCATIONS.FISHING_SPOT;
@@ -405,6 +412,75 @@ export class GameRenderer {
       label.x = loc.x * T + T / 2;
       label.y = loc.y * T - 12;
       this.locationLayer.addChild(label);
+    }
+  }
+
+  // berries on the bush, count scaled by patch yield (0..1)
+  _drawBerries(level) {
+    if (!this._berryGfx || !this._berryPos) return;
+    const bbx = this._berryPos.x * T + T / 2, bby = this._berryPos.y * T + T / 2;
+    this._berryGfx.clear();
+    const n = Math.round(6 * Math.max(0, Math.min(1, level)));
+    for (let i = 0; i < n; i++) {
+      const bax = bbx + Math.cos(i * 1.1) * 4, bay = bby + Math.sin(i * 1.4) * 3;
+      this._berryGfx.circle(bax, bay, 1.2).fill(0xcc2244);
+    }
+  }
+
+  // ── DYNAMIC ENVIRONMENT (#4) ──
+  // Reflect the sim's numeric resource state in the visible world: chopping thins
+  // the grove, foraging strips the berry bush, and the pond grows/shrinks with
+  // its water level. Cheap: only touches a handful of cached graphics, and only
+  // when a quantized level actually changes.
+  updateEnvironment(state) {
+    const patches = state?.patches || {};
+    // grove: fade and hide trees as yield drops (full→all up, low→a few stumps)
+    const grove = patches['Grove'] == null ? 1 : patches['Grove'];
+    if (this._groveTrees && this._lastGrove !== Math.round(grove * 10)) {
+      this._lastGrove = Math.round(grove * 10);
+      const visible = Math.max(2, Math.round(this._groveTrees.length * grove));
+      this._groveTrees.forEach((og, i) => {
+        og.visible = i < visible;
+        og.alpha = i < visible ? Math.max(0.5, grove) : 0;
+      });
+    }
+    // berry bush: thin the fruit with the patch
+    const berry = patches['Berry Bush'] == null ? 1 : patches['Berry Bush'];
+    if (this._lastBerry !== Math.round(berry * 6)) {
+      this._lastBerry = Math.round(berry * 6);
+      this._drawBerries(berry);
+    }
+    // pond: a shrinking dry-shore ring as the level falls (1 = full, lower = dry)
+    const level = state?.pond?.level == null ? 1 : state.pond.level;
+    if (this._lastPond !== Math.round(level * 20)) {
+      this._lastPond = Math.round(level * 20);
+      this._drawPondShore(level);
+    }
+  }
+
+  _drawPondShore(level) {
+    if (!this._pondShoreGfx) {
+      this._pondShoreGfx = new Graphics();
+      this.decorLayer.addChild(this._pondShoreGfx);
+    }
+    const g = this._pondShoreGfx;
+    g.clear();
+    // when full there's no exposed shore; as it drops, a muddy ring widens inward
+    const dryness = 1 - Math.max(0, Math.min(1, level));
+    if (dryness <= 0.01) return;
+    const p = LOCATIONS.POND;
+    const cx = p.x * T + T / 2, cy = p.y * T + T / 2;
+    const outer = 22, inner = outer * (1 - dryness * 0.6);
+    g.circle(cx, cy, outer).fill({ color: 0x6a5a40, alpha: 0.0 }); // keep bounds
+    g.circle(cx, cy, outer).stroke({ color: 0x6a5a40, width: (outer - inner), alpha: 0.18 * dryness });
+    // cracked-mud hint at high dryness
+    if (dryness > 0.4) {
+      for (let i = 0; i < 5; i++) {
+        const a = (i / 5) * Math.PI * 2;
+        g.moveTo(cx + Math.cos(a) * inner, cy + Math.sin(a) * inner)
+          .lineTo(cx + Math.cos(a) * outer, cy + Math.sin(a) * outer)
+          .stroke({ color: 0x4a3a26, width: 0.6, alpha: 0.3 * dryness });
+      }
     }
   }
 
@@ -573,6 +649,7 @@ export class GameRenderer {
         person.alive === false, person.lifeStage, person.gender, person.color, person.mood,
         isSleeping, isEating, isConversing, !!person.partner, person.pregnant,
         person.hunger > 60, person.tiredness > 70, walkPhase,
+        person.injury > 25, person.frailty > 30,
       ].join('|');
 
       if (view.sig !== sig) {
@@ -702,6 +779,15 @@ export class GameRenderer {
     }
 
     this._drawMouth(g, 0, -6 * s - bob, s, person.mood);
+
+    // frailty/injury cues (#10): a small cane for the frail, a red bandage mark
+    // for the injured — visible signs that decline precedes death.
+    if (person.frailty > 30 && !isEating) {
+      g.moveTo(7 * s, -2 * s - bob).lineTo(8 * s, 8 * s).stroke({ color: 0x6a5030, width: 1 * s });
+    }
+    if (person.injury > 25) {
+      g.rect(-5 * s, -2 * s - bob, 3 * s, 1.5 * s).fill(0xcc3322); // bandage/wound
+    }
     void tick;
   }
 

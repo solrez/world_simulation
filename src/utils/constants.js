@@ -111,6 +111,50 @@ export const PERSONALITIES = [
     background: 'Used to travel alone. Tells people he chose the wandering life but truth is he was running from grief — lost someone close and never dealt with it. Uses humor to keep people at arm\'s length. Notices everything about people but pretends he doesn\'t. Wants to be known but is terrified of it.',
     speechStyle: 'Chatty, uses humor to deflect. Makes references to things he\'s seen traveling. Says "honestly" before being dishonest. Gets surprisingly real late at night or when caught off guard. Trails off mid-thought when something hits close to home.',
   },
+  {
+    name: 'Maren',
+    gender: 'female',
+    age: 58,
+    color: 0xb0a0c8,
+    traits: ['responsible', 'observant', 'stubborn', 'warm-hearted'],
+    values: ['memory', 'continuity', 'protecting people'],
+    quirks: 'rubs her aching knee before rain, tells the same stories twice, keeps count of everyone\'s birthdays, falls quiet when tired',
+    background: 'The oldest in the settlement. Outlived a partner and buried more than one friend, so she carries the village\'s memory — who did what, what winters were hard, who can be trusted. Moves slower now and hates that she does. Dispenses unasked-for wisdom but is usually right. Afraid of being a burden, more afraid of being forgotten.',
+    speechStyle: 'Measured, a little formal. Starts with "In my day" or "I remember when". Pauses to catch her breath. Gentle but doesn\'t suffer fools. Calls people "child" regardless of age.',
+  },
+  {
+    name: 'Bram',
+    gender: 'male',
+    age: 34,
+    color: 0x6a9a8a,
+    traits: ['stoic', 'evasive', 'handy', 'impatient'],
+    values: ['independence', 'self-reliance', 'quiet'],
+    quirks: 'works with his back to people, sharpens tools that are already sharp, eats alone, answers questions with questions',
+    background: 'Keeps to the edge of things. Came to the settlement years ago and never fully joined it — builds and fixes more than anyone but rarely sits at the fire. People assume he\'s cold; really he never learned how to need anyone. Guards his patch of ground and his routine fiercely. Would help you in a crisis and vanish before you could thank him.',
+    speechStyle: 'Terse, flat. Long silences. Deflects personal questions. Will talk all day about how to do a thing, never about how he feels. Occasional dry, surprising kindness.',
+  },
+  {
+    name: 'Sela',
+    gender: 'female',
+    age: 27,
+    color: 0xe0b060,
+    traits: ['curious', 'funny', 'perceptive', 'impatient'],
+    values: ['connection', 'truth', 'belonging'],
+    quirks: 'knows everyone\'s business, can\'t keep a secret to save her life, fills silences, remembers exactly who said what',
+    background: 'The settlement\'s nerve center — she talks to everyone and carries news between them, sometimes faithfully, sometimes embroidered. Means no harm and does some anyway. Genuinely cares about people, which is why she can\'t stop discussing them. Terrified of being on the outside of things. Loyal once she trusts you, and she trusts fast.',
+    speechStyle: 'Fast, warm, leading. "Did you hear—", "Don\'t tell anyone but—". Asks three questions in a row. Reads faces while she talks. Backpedals when she\'s said too much.',
+  },
+  {
+    name: 'Tomas',
+    gender: 'male',
+    age: 30,
+    color: 0x9a7ad4,
+    traits: ['gentle', 'honest', 'responsible', 'anxious'],
+    values: ['fairness', 'harmony', 'kindness'],
+    quirks: 'steps between people who are arguing, apologizes preemptively, overthinks small choices, checks on the sick uninvited',
+    background: 'The one who smooths things over. Hates conflict so much he\'ll wear himself thin keeping the peace between others. Has a knack for tending wounds and worries, so people come to him when they hurt. Struggles to want anything for himself — gives until there\'s nothing left, then resents it quietly. Wants to be needed, fears being used.',
+    speechStyle: 'Soft, careful, diplomatic. "I just think—", "Maybe we could—". Validates before disagreeing. Goes quiet and tense when voices rise. Warmer and surer when caring for someone hurt.',
+  },
 ];
 
 // ── Per-agent model pool (OpenRouter) ──
@@ -233,6 +277,53 @@ export const FOOD_TYPES = {
 export const PATCH_MIN = 0.25;        // yield multiplier never drops below this
 export const PATCH_DEPLETE = 0.04;    // lost per successful harvest
 export const PATCH_REGROW_PER_DAY = 0.5;
+
+// The Grove is a patch too: chopping wood thins it (and is rendered thinner),
+// and it regrows more slowly than berries — trees take time.
+export const GROVE_DEPLETE = 0.03;        // lost per successful chop
+export const GROVE_REGROW_PER_DAY = 0.18; // slow recovery
+
+// ── Pond water level (rises with rain, shrinks in drought/winter) ──
+// Purely numeric; the renderer reads it to grow/shrink the visible water.
+export const POND_LEVEL_MAX = 1.0;
+export const POND_LEVEL_MIN = 0.4;
+export const POND_RAIN_GAIN = 0.06;       // per rainy/storm day
+export const POND_EVAP = { spring: 0.01, summer: 0.05, fall: 0.015, winter: 0.0 }; // dry per day
+
+// ── Chronotypes — break the uniform daily clock ──
+// An agent's effective time-of-day for scheduling is shifted by this many hours
+// from the world clock, so early-risers populate dawn and night-owls roam late.
+export const CHRONOTYPE_OFFSET = { early: -2, normal: 0, night: 3 };
+// Traits that push someone toward each chronotype (first match wins; else normal).
+export const CHRONOTYPE_TRAITS = {
+  night: ['restless', 'funny', 'anxious', 'deflective', 'curious'],
+  early: ['responsible', 'stoic', 'handy'],
+};
+
+// ── Reputation ──
+// The village's collective read on a person along a few axes (−100..100).
+// Earned by visible deeds; spread (and distorted) by gossip. Each agent also
+// holds private `reputationBeliefs` that gossip nudges toward the speaker's view.
+export const REPUTATION_DIMS = ['generous', 'kind', 'skilled', 'reliable', 'brave'];
+export const REPUTATION_DECAY_PER_DAY = 0.985; // standing slowly fades toward neutral
+export const GOSSIP_PULL = 0.35;               // how far a listener's belief moves toward the gossip
+export const GOSSIP_CHANCE = 0.18;             // chance a conversation turns to an absent third party
+
+// ── Health, frailty & injury — death gets a lead-up ──
+export const FRAILTY_START_AGE = 55;        // elders begin to decline
+export const FRAILTY_PER_DAY = 2.5;         // frailty accrued per game-day as an elder (1 yr/day)
+export const HEALTH_REGEN_PER_DAY = 4;      // baseline daily healing when not stressed
+export const INJURY_HEAL_PER_DAY = 6;       // injury severity recovered per day (more with a healer)
+export const HEALER_HEAL_BONUS = 10;        // extra injury recovery/day when tended by a healer
+export const FRAILTY_SPEED_PENALTY = 0.4;   // max fraction of speed lost at full frailty
+export const INJURY_SPEED_PENALTY = 0.5;    // max fraction of speed lost at full injury
+
+// ── Per-model success router ──
+// Track each model's recent reliability and bias new assignments toward models
+// that actually return usable output. Laplace smoothing keeps it from over-
+// committing on tiny samples, and a floor keeps every model occasionally tried.
+export const MODEL_SMOOTHING = 4;       // pseudo-successes + pseudo-failures
+export const MODEL_WEIGHT_FLOOR = 0.08; // min selection weight so nothing is fully banned
 
 // ── Q-learning-lite ──
 export const Q_ALPHA = 0.2;     // learning rate (estimate moves this fraction toward reward)

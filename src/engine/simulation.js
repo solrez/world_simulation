@@ -1,7 +1,7 @@
-import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, SKILLS, AMBIENT_EVENTS, BUILD_REQUIREMENTS, BUILD_PHASES, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, MODEL_POOL } from '../utils/constants.js';
+import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, SKILLS, AMBIENT_EVENTS, BUILD_REQUIREMENTS, BUILD_PHASES, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, MODEL_POOL, CHRONOTYPE_OFFSET, CHRONOTYPE_TRAITS, GROVE_DEPLETE, GROVE_REGROW_PER_DAY, POND_LEVEL_MAX, POND_LEVEL_MIN, POND_RAIN_GAIN, POND_EVAP, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, MODEL_SMOOTHING, MODEL_WEIGHT_FLOOR } from '../utils/constants.js';
 import { buildWalkableGrid, findPath, nearestWalkable } from './pathfinding.js';
 import { nearestVisiblePrey } from './vision.js';
-import { generateGroupDialogue, generateAction } from './ai.js';
+import { generateGroupDialogue, generateAction, generateGossip, generateTeaching } from './ai.js';
 
 // ── Conversation Archive (persisted to localStorage) ──
 
@@ -148,6 +148,58 @@ function getLifeStage(age) {
   return LIFE_STAGES.ELDER;
 }
 
+// A person's chronotype from their traits — first matching group wins. Drives a
+// per-person shift of the daily schedule so the village isn't all on one clock.
+function chronotypeFor(traits = []) {
+  if (traits.some(t => CHRONOTYPE_TRAITS.night.includes(t))) return 'night';
+  if (traits.some(t => CHRONOTYPE_TRAITS.early.includes(t))) return 'early';
+  return 'normal';
+}
+
+// Record whether a model returned usable output, for the assignment router (#8).
+function recordModelResult(state, model, ok) {
+  if (!model || !state) return;
+  if (!state.modelStats) state.modelStats = {};
+  const s = state.modelStats[model] || (state.modelStats[model] = { calls: 0, ok: 0, fail: 0 });
+  s.calls++;
+  if (ok) s.ok++; else s.fail++;
+}
+
+// Once a day, move agents off a model that's proven unreliable to a weighted
+// pick from the pool — voices stay mostly stable, but a flaky model bleeds out
+// of rotation over time. Only acts on models with enough samples to judge.
+function reassignFlakyModels(state) {
+  const ms = state.modelStats;
+  if (!ms) return;
+  for (const p of state.people) {
+    if (p.alive === false) continue;
+    const s = ms[p.model];
+    if (!s || s.calls < 6) continue;
+    const rate = s.ok / s.calls;
+    if (rate < 0.5 && Math.random() < (0.5 - rate)) {
+      const next = pickModelWeighted(ms);
+      if (next && next !== p.model) p.model = next;
+    }
+  }
+}
+
+// Pick a model from the pool weighted by recent reliability (Laplace-smoothed
+// success rate), so flaky models get assigned less without ever being banned.
+// Falls back to uniform random when no stats exist yet.
+function pickModelWeighted(modelStats) {
+  if (!modelStats) return MODEL_POOL[Math.floor(Math.random() * MODEL_POOL.length)];
+  const weights = MODEL_POOL.map(m => {
+    const s = modelStats[m];
+    const ok = (s?.ok || 0) + MODEL_SMOOTHING;
+    const total = (s?.ok || 0) + (s?.fail || 0) + 2 * MODEL_SMOOTHING;
+    return Math.max(MODEL_WEIGHT_FLOOR, ok / total);
+  });
+  const sum = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * sum;
+  for (let i = 0; i < MODEL_POOL.length; i++) { r -= weights[i]; if (r <= 0) return MODEL_POOL[i]; }
+  return MODEL_POOL[MODEL_POOL.length - 1];
+}
+
 // daily schedule slots
 const SCHEDULE = {
   night:     'sleep',
@@ -183,7 +235,7 @@ function generateAmbitions(config) {
 
 function initPerson(config, index, startX, startY) {
   const cf = LOCATIONS.CAMPFIRE;
-  const angle = (index / 4) * Math.PI * 2;
+  const angle = (index / Math.max(1, PERSONALITIES.length)) * Math.PI * 2;
   const dist = 3 + Math.random() * 5;
   return {
     ...config,
@@ -194,9 +246,12 @@ function initPerson(config, index, startX, startY) {
     path: null, _pathDest: null,
     currentLocation: 'village',
     // the LLM this agent "thinks" with — distinct model = distinct voice. A child
-    // may inherit its model below; otherwise pick randomly from the pool.
-    model: config.model || MODEL_POOL[Math.floor(Math.random() * MODEL_POOL.length)],
+    // may inherit its model below; otherwise pick weighted by recent reliability
+    // (config._modelStats passed in when known; undefined → uniform random).
+    model: config.model || pickModelWeighted(config._modelStats),
     lifeStage: getLifeStage(config.age),
+    // chronotype shifts this agent's effective schedule clock (early/normal/night)
+    chronotype: config.chronotype || chronotypeFor(config.traits),
     mood: 'neutral',
     activity: 'exploring',
     relationships: {},
@@ -243,8 +298,15 @@ function initPerson(config, index, startX, startY) {
     // illness
     sick: false,
     sickTimer: 0,
+    // health, frailty & injury — gradual decline gives death a lead-up
+    health: 100,
+    frailty: config.age >= FRAILTY_START_AGE ? Math.min(100, (config.age - FRAILTY_START_AGE) * FRAILTY_PER_DAY) : 0,
+    injury: 0,        // 0..100 severity; heals over days, faster with a healer
+    acheTimer: 0,     // throttles "my knees ache" complaints
     // favorite location
     favoriteLocation: null,
+    // each agent's private read on others (gossip nudges these); keyed by name
+    reputationBeliefs: {},
     // inventory (materials) + typed food larder
     inventory: { wood: 0, stone: 0, thatch: 0 },
     larder: { meat: 0, fish: 0, berries: 3, crops: 0 },
@@ -298,10 +360,19 @@ function canBeAttracted(a, b) {
 
 // ── State ──
 
+// A blank reputation record (all dimensions neutral at 0).
+function blankReputation() {
+  const r = {};
+  for (const d of REPUTATION_DIMS) r[d] = 0;
+  return r;
+}
+
 export function createSimulation() {
   const terrain = generateTerrain();
   const people = PERSONALITIES.map((p, i) => initPerson(p, i));
   initRelationships(people);
+  const reputation = {};
+  for (const p of people) reputation[p.name] = blankReputation();
   return {
     terrain, people, buildings: [],
     wildlife: spawnInitialWildlife(),
@@ -310,9 +381,15 @@ export function createSimulation() {
     season: 'spring',
     // shared village larder (typed) + resource-patch depletion state
     larder: { meat: 8, fish: 12, berries: 20, crops: 6 },
-    patches: { 'Berry Bush': 1, 'Fishing Spot': 1, 'Meadow': 1 },
+    patches: { 'Berry Bush': 1, 'Fishing Spot': 1, 'Meadow': 1, 'Grove': 1 },
     // the communal field: fallow to start, waiting for someone to sow it
     field: { planted: false, stage: 0, plantedDay: null },
+    // pond water level (rises with rain, shrinks in drought/winter) — visible
+    pond: { level: 1 },
+    // collective village reputation: { [name]: { generous, kind, skilled, ... } }
+    reputation,
+    // per-model reliability stats for the assignment router (#8)
+    modelStats: {},
     stats: { totalBirths: 0, totalDeaths: 0, totalPartnerships: 0, totalConversations: 0 },
     events: [], conversations: [], activeConversations: [],
     nextConvoId: 1, tick: 0, speed: 1, paused: false,
@@ -390,6 +467,10 @@ function updateWildlife(state) {
         target.hunger = Math.min(100, target.hunger + 15);
         target.tiredness = Math.min(100, target.tiredness + 10);
         target.mood = 'anxious';
+        // a real wound — injury heals over days (faster with a healer) and can
+        // worsen into death if untreated; telegraphs danger before it's fatal (#10)
+        target.injury = Math.min(100, (target.injury || 0) + 30 + Math.random() * 20);
+        target.health = clamp((target.health ?? 100) - 12, 0, 100);
         setEmote(target, 'fear', 30);
         addMemory(target, `Was attacked by a ${animal.type}!`, 'danger', state.day, { location: locationAt(target.x, target.y) });
         state.events.push({ day: state.day, hour: state.hour, participants: [target.name], summary: `🐺 ${target.name} was attacked by a ${animal.type}!`, type: 'danger' });
@@ -478,6 +559,8 @@ function processHunting(person, state) {
       person.thought = `Got the ${prey.type}! ${meat} meat.`;
       addMemory(person, `Caught a ${prey.type}! Got ${meat} meat.`, 'achievement', state.day, { location: person.currentLocation });
       state.events.push({ day: state.day, hour: state.hour, participants: [person.name], summary: `🏹 ${person.name} caught a ${prey.type}!`, type: 'hunt' });
+      bumpReputation(state, person.name, 'skilled', 2);
+      if (prey.dangerous) bumpReputation(state, person.name, 'brave', 4); // bringing down a wolf is talked about
     } else if (prey.dangerous && Math.random() < 0.25) {
       // dangerous prey fights back — real risk the Q-table learns to weigh
       person.hunger = Math.min(100, person.hunger + 8);
@@ -506,6 +589,15 @@ function getTimeOfDay(hour) {
   if (hour < 18) return 'afternoon';
   if (hour < 21) return 'evening';
   return 'night';
+}
+
+// The schedule slot a person is on RIGHT NOW, after shifting the world clock by
+// their chronotype. An early-riser experiences "morning/work" before dawn; a
+// night-owl is still in "free/social" when others have gone to sleep.
+function personTimeOfDay(person, state) {
+  const off = CHRONOTYPE_OFFSET[person.chronotype] ?? 0;
+  const h = (((state.hour + (state.minute || 0) / 60) - off) % 24 + 24) % 24;
+  return getTimeOfDay(h);
 }
 function distBetween(a, b) { return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2); }
 function locationAt(x, y) {
@@ -630,15 +722,17 @@ function startWorkAction(person, action, state) {
 }
 
 function pickTarget(person, people, state) {
-  const schedule = SCHEDULE[state.timeOfDay] || 'free';
+  // each agent runs on their own chronotype-shifted clock, so the village isn't
+  // all asleep or all working at once.
+  const schedule = SCHEDULE[personTimeOfDay(person, state)] || 'free';
 
   // daily routine drives behavior
   switch (schedule) {
     case 'sleep':
       if (person.tiredness > 30) return; // let needsDriven handle sleep
-      // night owls might wander
-      if (person.traits.includes('restless') || Math.random() < 0.2) {
-        goToLocation(person, 'Campfire');
+      // those still awake on their clock wander rather than freeze
+      if (person.chronotype === 'night' || person.traits.includes('restless') || Math.random() < 0.2) {
+        goToLocation(person, person.favoriteLocation || 'Campfire');
         setGoal(person, 'wander', null, 20);
       }
       return;
@@ -669,6 +763,11 @@ function pickTarget(person, people, state) {
       if (person.partner && Math.random() < 0.3) {
         const partner = people.find(p => p.name === person.partner);
         if (partner && !partner.sleeping) { goToPerson(person, partner); setGoal(person, 'seek', partner.name, 25); return; }
+      }
+      // homebodies (loners/elders) gravitate to their own spot — territoriality
+      if (person.favoriteLocation && person.loneliness < 45) {
+        const homey = person.traits.includes('evasive') || person.lifeStage === LIFE_STAGES.ELDER ? 0.5 : 0.25;
+        if (Math.random() < homey) { goToLocation(person, person.favoriteLocation); setGoal(person, 'wander', null, 25); return; }
       }
       if (person.loneliness > 40 || Math.random() < 0.4) {
         pickSocialTarget(person, people);
@@ -1090,7 +1189,15 @@ function processFoodSharing(person, people, state) {
       if (otherRel) otherRel.affection = clamp(otherRel.affection + 3, 0, 100);
       addMemory(other, `${person.name} shared food with me`, 'kindness', state.day, { location: other.currentLocation });
       person.thought = `I gave food to ${other.name}`;
+      // a visible kindness — earns a name for generosity (#2)
+      bumpReputation(state, person.name, 'generous', 3);
+      bumpReputation(state, person.name, 'kind', 1.5);
       break;
+    } else if ((other.hunger > 75 && totalFood(person) > 6) && Math.random() < 0.02) {
+      // hoarding while a hungry villager stands right there — a name for selfishness
+      bumpReputation(state, person.name, 'generous', -2);
+      if (other.relationships[person.name]) other.relationships[person.name].affection = clamp(other.relationships[person.name].affection - 1, 0, 100);
+      addMemory(other, `${person.name} wouldn't share food while I was starving`, 'conflict', state.day, { location: other.currentLocation });
     }
   }
 }
@@ -1337,6 +1444,8 @@ export function simulateTick(state) {
     processGrief(person);
     processAmbitions(person, next);
     processPersonalityConflict(person, alivePeople, next);
+    processFrailty(person, alivePeople, next, dayRolled);
+    processAdultTeaching(person, alivePeople);
 
     for (const otherName of Object.keys(person.relationships))
       updateRelationshipStage(person, otherName, alivePeople);
@@ -1527,11 +1636,88 @@ function depletePatch(state, name) {
   const cur = state.patches[name] == null ? 1 : state.patches[name];
   state.patches[name] = Math.max(PATCH_MIN, cur - PATCH_DEPLETE);
 }
+function depleteGrove(state) {
+  if (!state.patches) state.patches = {};
+  const cur = state.patches['Grove'] == null ? 1 : state.patches['Grove'];
+  state.patches['Grove'] = Math.max(PATCH_MIN, cur - GROVE_DEPLETE);
+}
 function regrowPatches(state) {
   if (!state.patches) return;
   for (const k of Object.keys(state.patches)) {
-    state.patches[k] = Math.min(1, state.patches[k] + PATCH_REGROW_PER_DAY);
+    // the Grove recovers more slowly than berry/fishing patches — trees take time
+    const rate = k === 'Grove' ? GROVE_REGROW_PER_DAY : PATCH_REGROW_PER_DAY;
+    state.patches[k] = Math.min(1, state.patches[k] + rate);
   }
+}
+
+// Pond level rises with rain, evaporates in dry seasons — drives the visible water.
+function updatePond(state) {
+  if (!state.pond) state.pond = { level: 1 };
+  const rained = state.weather === 'rainy' || state.weather === 'storm';
+  let lvl = state.pond.level + (rained ? POND_RAIN_GAIN : 0) - (POND_EVAP[state.season] || 0.02);
+  state.pond.level = clamp(lvl, POND_LEVEL_MIN, POND_LEVEL_MAX);
+}
+
+// ── Reputation ──
+// Nudge the village's collective read on `name` along one dimension, and slowly
+// decay everyone's standing toward neutral so reputations must be re-earned.
+function bumpReputation(state, name, dim, delta) {
+  if (!state.reputation) state.reputation = {};
+  const r = state.reputation[name] || (state.reputation[name] = blankReputation());
+  if (r[dim] == null) r[dim] = 0;
+  r[dim] = clamp(r[dim] + delta, -100, 100);
+}
+function decayReputation(state) {
+  if (!state.reputation) return;
+  for (const rec of Object.values(state.reputation))
+    for (const d of REPUTATION_DIMS) rec[d] = (rec[d] || 0) * REPUTATION_DECAY_PER_DAY;
+}
+// Choose a juicy absent third party to gossip about: someone the speaker has a
+// relationship with who ISN'T in the current conversation. Prefers people the
+// speaker feels strongly about (high or low affection) — those make better talk.
+function pickGossipTarget(speaker, present, allPeople) {
+  const presentNames = new Set([speaker.name, ...present.map(p => p.name)]);
+  const candidates = allPeople.filter(p => p.alive !== false && !presentNames.has(p.name) && speaker.relationships?.[p.name]?.familiarity > 10);
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => {
+    const ra = speaker.relationships[a.name], rb = speaker.relationships[b.name];
+    return Math.abs((rb.affection ?? 50) - 50) - Math.abs((ra.affection ?? 50) - 50);
+  });
+  // mostly the most-salient, sometimes a random other for variety
+  return Math.random() < 0.7 ? candidates[0] : candidates[Math.floor(Math.random() * candidates.length)];
+}
+
+// A listener hearing gossip nudges their private belief about the absent person
+// toward the speaker's lean — this is how reputation travels third-hand.
+function applyGossip(speaker, listeners, absentName, sign, state) {
+  if (!sign) return;
+  const villageRep = (state.reputation || {})[absentName] || blankReputation();
+  for (const listener of listeners) {
+    if (!listener.reputationBeliefs) listener.reputationBeliefs = {};
+    const belief = listener.reputationBeliefs[absentName] || (listener.reputationBeliefs[absentName] = { ...villageRep });
+    // pull the belief toward a generally-good or generally-bad read
+    for (const d of REPUTATION_DIMS) {
+      const target = sign * 30;
+      belief[d] = clamp((belief[d] || 0) + (target - (belief[d] || 0)) * GOSSIP_PULL, -100, 100);
+    }
+    // trusting the speaker, the listener's own affection drifts slightly too
+    const lr = listener.relationships?.[absentName];
+    if (lr) lr.affection = clamp(lr.affection + sign * 1.5, 0, 100);
+  }
+}
+
+// The single word the village most associates with someone (for prompts), or null.
+function reputationLabel(state, name) {
+  const r = state.reputation?.[name];
+  if (!r) return null;
+  let best = null, mag = 12; // needs a real reputation to surface
+  for (const d of REPUTATION_DIMS) {
+    if (Math.abs(r[d]) > mag) { mag = Math.abs(r[d]); best = { dim: d, val: r[d] }; }
+  }
+  if (!best) return null;
+  const POS = { generous: 'generous', kind: 'kind', skilled: 'highly skilled', reliable: 'dependable', brave: 'brave' };
+  const NEG = { generous: 'selfish', kind: 'cold', skilled: 'unskilled', reliable: 'unreliable', brave: 'timid' };
+  return best.val > 0 ? POS[best.dim] : NEG[best.dim];
 }
 
 // ── Farming: the communal field grows over days, only in growing seasons ──
@@ -1566,6 +1752,19 @@ function rewardAction(person, action, reward, state) {
 function topSkill(person) {
   let best = null, max = 8; // must be meaningfully skilled to "be" something
   for (const [k, v] of Object.entries(person.skills || {})) if (v > max) { max = v; best = k; }
+  return best;
+}
+
+// The village's go-to person for a given skill (its best living practitioner
+// above a competence floor), excluding `exclude`. Powers specialist-seeking (#5):
+// the sick seek the best healer, the hungry the best provider, etc.
+function bestSpecialist(people, skill, exclude, floor = 20) {
+  let best = null, max = floor;
+  for (const p of people) {
+    if (p.alive === false || p === exclude || p.name === exclude?.name) continue;
+    const v = p.skills?.[skill] || 0;
+    if (v > max) { max = v; best = p; }
+  }
   return best;
 }
 
@@ -1618,11 +1817,12 @@ function updateSkills(person, state) {
     }
   }
 
-  // chopping wood at Grove
+  // chopping wood at Grove — depletes the grove (visibly thins) and regrows slowly
   if ((person.activity === 'chopping' || person.activity === 'working') && loc === 'Grove') {
-    if (Math.random() < (0.012 + person.skills.building * 0.0004) * (tools.axe ? 1.6 : 1)) {
+    if (Math.random() < (0.012 + person.skills.building * 0.0004) * (tools.axe ? 1.6 : 1) * patchYield(state, 'Grove')) {
       person.inventory.wood++;
       gainSkill(person, 'building');
+      depleteGrove(state);
       rewardAction(person, 'chop_wood', 1, state);
       person.thought = `Chopped a log! (${person.inventory.wood} total)`;
       setEmote(person, 'sparkle', 8);
@@ -1653,6 +1853,8 @@ function updateSkills(person, state) {
       rewardAction(person, 'farm', yield_, state);
       addMemory(person, `Harvested ${yield_} crops from the field!`, 'achievement', state.day, { location: 'Field' });
       state.events.push({ day: state.day, hour: state.hour, participants: [person.name], summary: `🌾 ${person.name} harvested the field!`, type: 'harvest' });
+      bumpReputation(state, person.name, 'skilled', 2);
+      bumpReputation(state, person.name, 'generous', 1); // feeds the village
       setEmote(person, 'sparkle', 20);
       person.thought = `Harvested ${yield_} crops!`;
       f.planted = false; f.stage = 0; f.plantedDay = null; // back to fallow
@@ -1728,6 +1930,31 @@ function childLearnFromParent(child, parent) {
   }
 }
 
+// ── Adult skill transfer (#7) ──
+// Knowledge spreads between grown villagers, not just parent→child. When a novice
+// lingers near a clear expert, the novice drifts upward in that skill — a slow,
+// ambient apprenticeship. Occasionally it sparks an explicit teaching exchange
+// (flagged here, run as an LLM beat by the conversation system).
+function processAdultTeaching(person, people) {
+  if (person.alive === false || person.sleeping || person.conversationId) return;
+  if (person.lifeStage === LIFE_STAGES.BABY || person.lifeStage === LIFE_STAGES.CHILD) return;
+  const mySkill = topSkill(person);
+  if (!mySkill || (person.skills[mySkill] || 0) < 25) return; // must be a real expert
+  for (const other of people) {
+    if (other === person || other.alive === false || other.sleeping) continue;
+    if (other.lifeStage === LIFE_STAGES.BABY) continue;
+    if (distBetween(person, other) > 3) continue;
+    const gap = (person.skills[mySkill] || 0) - (other.skills[mySkill] || 0);
+    if (gap < 15) continue; // only worth teaching a clear novice
+    // ambient drift — the novice picks a little up just by being around mastery
+    other.skills[mySkill] = Math.min(100, (other.skills[mySkill] || 0) + 0.02);
+    // occasionally escalate to an explicit lesson (handled as a conversation beat)
+    if (!person._pendingTeach && person.conversationCooldown <= 0 && Math.random() < 0.0008) {
+      person._pendingTeach = { student: other.name, skill: mySkill };
+    }
+  }
+}
+
 // ── Illness ──
 
 function processIllness(person, state) {
@@ -1738,12 +1965,21 @@ function processIllness(person, state) {
     person.sickTimer--;
     person.tiredness = Math.min(100, person.tiredness + 0.3);
     person.hunger = Math.min(100, person.hunger + 0.1);
+
+    // seek out the village's best healer rather than suffering alone (#5)
+    const healer = bestSpecialist(state.people, 'healing', person);
+    if (healer && !person.currentGoal && distBetween(person, healer) > 3 && !healer.sleeping) {
+      goToPerson(person, healer);
+      person.activity = 'seeking';
+      setGoal(person, 'seek_healer', healer.name, 30);
+      person.thought = `I should find ${healer.name} — they know healing.`;
+    }
     if (person.sickTimer <= 0) {
       person.sick = false;
       person.mood = 'content';
       addMemory(person, 'Recovered from illness', 'life', state.day, { location: person.currentLocation });
     }
-    // healer nearby can speed recovery
+    // healer nearby can speed recovery — and earns a name for it (#2/#5)
     const alivePeople = state.people.filter(p => p.alive !== false && p.name !== person.name);
     for (const p of alivePeople) {
       if (p.skills.healing > 20 && distBetween(person, p) < 4) {
@@ -1753,12 +1989,17 @@ function processIllness(person, state) {
           p.activity = 'healing';
           setGoal(p, 'heal', person.name, 15);
         }
+        if (Math.random() < 0.01) {
+          bumpReputation(state, p.name, 'kind', 2);
+          bumpReputation(state, p.name, 'skilled', 1);
+          const sr = person.relationships[p.name];
+          if (sr) { sr.affection = clamp(sr.affection + 1, 0, 100); sr.trust = clamp(sr.trust + 1, 0, 100); }
+        }
       }
     }
-    // death from illness
-    if (person.hunger > 95 && person.sick && Math.random() < 0.002) {
-      killPerson(person, state, 'illness');
-    }
+    // severe illness erodes health rather than flipping a kill switch — the
+    // decline shows up first (frail, achy, slow) and processDeath finishes it (#10)
+    if (person.hunger > 90) person.health = clamp((person.health ?? 100) - 0.05, 0, 100);
     return;
   }
 
@@ -1854,6 +2095,9 @@ function processResources(state, dayRolled) {
     }
     regrowPatches(state);
     growField(state);
+    updatePond(state);
+    decayReputation(state);
+    reassignFlakyModels(state);
   }
   // famine: empty larder makes everyone hungrier faster
   if (totalFood(state) <= 0) {
@@ -1912,21 +2156,76 @@ function processPersonalityConflict(person, people, state) {
   }
 }
 
-// ── Death (much rarer — scaled for 1-min ticks) ──
+// ── Frailty, injury & health — give death a lead-up (#10) ──
+// Elders slowly grow frail (slower, achier); injuries heal over days, faster if
+// a healer is near; sustained hunger and frailty erode `health`, which is what
+// processDeath now reads. The effective movement speed reflects both.
+function effectiveSpeed(person) {
+  const base = person._baseSpeed ?? person.speed ?? 0.4;
+  const frailMul = 1 - Math.min(1, (person.frailty || 0) / 100) * FRAILTY_SPEED_PENALTY;
+  const injMul = 1 - Math.min(1, (person.injury || 0) / 100) * INJURY_SPEED_PENALTY;
+  return base * frailMul * injMul;
+}
+
+function processFrailty(person, people, state, dayRolled) {
+  if (person.alive === false) return;
+  // remember the un-penalized speed once so penalties compose cleanly
+  if (person._baseSpeed == null) person._baseSpeed = person.speed;
+
+  if (dayRolled) {
+    // elders accrue frailty; injuries heal (a nearby healer speeds recovery)
+    if (person.lifeStage === LIFE_STAGES.ELDER) person.frailty = Math.min(100, (person.frailty || 0) + FRAILTY_PER_DAY);
+    if (person.injury > 0) {
+      const healerNear = people.some(p => p !== person && p.alive !== false && (p.skills?.healing || 0) > 25 && distBetween(p, person) < 5);
+      person.injury = Math.max(0, person.injury - INJURY_HEAL_PER_DAY - (healerNear ? HEALER_HEAL_BONUS : 0));
+    }
+    // daily health accounting: regen when well, erode under stress/frailty/injury
+    let dh = HEALTH_REGEN_PER_DAY;
+    if (person.hunger > 80) dh -= 6;
+    if (person.sick) dh -= 5;
+    dh -= (person.frailty || 0) * 0.08;
+    dh -= (person.injury || 0) * 0.05;
+    person.health = clamp((person.health ?? 100) + dh, 0, 100);
+  }
+
+  // apply frailty/injury to live movement speed
+  person.speed = effectiveSpeed(person);
+
+  // elders occasionally voice their aches — flavor that telegraphs decline
+  if ((person.frailty > 20 || person.injury > 20) && person.acheTimer <= 0 && !person.sleeping && Math.random() < 0.002) {
+    person.acheTimer = 300;
+    setEmote(person, 'sick', 18);
+    if (person.mood === 'neutral' || person.mood === 'content') person.mood = 'thoughtful';
+    person.thought = person.injury > 20 ? 'This wound still aches...' : 'My old bones aren\'t what they were.';
+  }
+  if (person.acheTimer > 0) person.acheTimer--;
+}
+
+// ── Death — now driven by declining health, not a pure random flip (#10) ──
 
 function processDeath(person, state) {
   if (person.alive === false) return;
-  // old age — only elders, very rarely
-  if (person.lifeStage === LIFE_STAGES.ELDER && Math.random() < 0.00005) {
-    killPerson(person, state, 'old age');
+  const h = person.health ?? 100;
+  // failing health is the main path out — likelier the lower it gets, and only
+  // really bites for elders, the badly injured, or the starving.
+  if (h < 35) {
+    const risk = ((35 - h) / 35) * 0.004;
+    if (Math.random() < risk) {
+      const cause = person.injury > 50 ? 'their injuries'
+        : person.sick ? 'a long illness'
+        : person.lifeStage === LIFE_STAGES.ELDER ? 'old age'
+        : person.hunger >= 90 ? 'starvation and weakness'
+        : 'failing health';
+      killPerson(person, state, cause);
+      return;
+    }
   }
-  // starvation — only after prolonged extreme hunger AND exhaustion
-  if (person.hunger >= 98 && person.tiredness >= 95 && Math.random() < 0.001) {
-    killPerson(person, state, 'exhaustion and starvation');
-  }
-  // accident (extremely rare)
-  if (Math.random() < 0.000005) {
-    killPerson(person, state, 'an accident');
+  // a small floor of genuine accidents keeps mortality from being fully predictable
+  if (Math.random() < 0.000004) {
+    person.injury = Math.min(100, (person.injury || 0) + 40);
+    person.health = clamp((person.health ?? 100) - 15, 0, 100);
+    setEmote(person, 'fear', 20);
+    addMemory(person, 'Had a bad accident', 'danger', state.day, { location: person.currentLocation });
   }
 }
 
@@ -2153,10 +2452,12 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
     // reject garbage: empty, or not predominantly latin/English (some pool models
     // drift into other scripts). Count it as a failure for this speaker.
     if (!result || !dialogue || !isUsableDialogue(dialogue)) {
+      recordModelResult(gameRef.current, speaker.model, false); // model produced garbage (#8)
       failCount.set(speaker.name, failCount.get(speaker.name) + 1);
       await new Promise(r => setTimeout(r, 500));
       continue;
     }
+    recordModelResult(gameRef.current, speaker.model, true);
 
     // cheap models love to parrot — drop a line that nearly duplicates one this
     // conversation already had. Retry (doesn't count toward produced lines).
@@ -2200,11 +2501,53 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
     else if (result.mood_after === 'sad') setEmote(speaker, 'tear', 15);
     else if (result.mood_after === 'excited') setEmote(speaker, 'sparkle', 15);
 
-    const convos = gameRef.current.activeConversations.map(c =>
+    let convos = gameRef.current.activeConversations.map(c =>
       c.id === convoId ? { ...conversation, lines: [...conversation.lines] } : c
     );
     gameRef.current = { ...gameRef.current, activeConversations: convos };
     onUpdate();
+
+    // ── GOSSIP BEAT (#2) ── occasionally the speaker turns to an absent third
+    // party. Listeners present shift their private belief toward the speaker's
+    // lean, so reputation spreads (and distorts) without direct interaction.
+    if (!signal?.aborted && produced >= 2 && Math.random() < GOSSIP_CHANCE) {
+      const absent = pickGossipTarget(speaker, others, cs.people);
+      if (absent) {
+        const g = await generateGossip(speaker, others[0], absent.name, cs, signal);
+        if (g && isUsableDialogue(g.dialogue)) {
+          conversation.lines.push({ speaker: speaker.name, text: g.dialogue, thought: `(about ${absent.name})`, mood: speaker.mood, addressedTo: others[0].name });
+          const sign = g.lean === 'positive' ? 1 : g.lean === 'negative' ? -1 : 0;
+          applyGossip(speaker, others, absent.name, sign, cs);
+          convos = gameRef.current.activeConversations.map(c => c.id === convoId ? { ...conversation, lines: [...conversation.lines] } : c);
+          gameRef.current = { ...gameRef.current, activeConversations: convos };
+          onUpdate();
+        }
+      }
+    }
+
+    // ── TEACHING BEAT (#7) ── if the speaker is a flagged expert and a present
+    // novice needs the lesson, run a short teaching exchange and bump their skill.
+    if (!signal?.aborted && speaker._pendingTeach) {
+      const student = others.find(o => o.name === speaker._pendingTeach.student);
+      const skill = speaker._pendingTeach.skill;
+      speaker._pendingTeach = null;
+      if (student && skill) {
+        const t = await generateTeaching(speaker, student, skill, signal);
+        if (t && isUsableDialogue(t.dialogue)) {
+          conversation.lines.push({ speaker: speaker.name, text: t.dialogue, thought: `(teaching ${student.name} about ${skill})`, mood: speaker.mood, addressedTo: student.name });
+          student.skills[skill] = Math.min(100, (student.skills[skill] || 0) + 1.5);
+          addMemory(student, `${speaker.name} taught me about ${skill}`, 'kindness', cs.day, { location: conversation.location });
+          addMemory(speaker, `Taught ${student.name} about ${skill}`, 'achievement', cs.day, { location: conversation.location });
+          bumpReputation(cs, speaker.name, 'kind', 2);
+          bumpReputation(cs, speaker.name, 'skilled', 1);
+          const sr = student.relationships[speaker.name];
+          if (sr) { sr.affection = clamp(sr.affection + 3, 0, 100); sr.trust = clamp(sr.trust + 3, 0, 100); }
+          convos = gameRef.current.activeConversations.map(c => c.id === convoId ? { ...conversation, lines: [...conversation.lines] } : c);
+          gameRef.current = { ...gameRef.current, activeConversations: convos };
+          onUpdate();
+        }
+      }
+    }
 
     // let people leave once there's been a real exchange (not after line 1)
     if (!result.wants_to_continue && produced >= participants.length * 2) {
@@ -2321,6 +2664,14 @@ export async function runAIAction(gameRef, personIdx, signal) {
   if (person.actionCooldown > 0 && person.currentGoal?.until > 0) return;
 
   const cs = gameRef.current;
+  // who the village turns to for each role — surfaced so the LLM can choose to
+  // seek the right specialist (the best healer, hunter, builder) (#5)
+  const specialists = {
+    healer: bestSpecialist(cs.people, 'healing', person)?.name || null,
+    hunter: bestSpecialist(cs.people, 'hunting', person)?.name || null,
+    builder: bestSpecialist(cs.people, 'building', person)?.name || null,
+    forager: bestSpecialist(cs.people, 'foraging', person)?.name || null,
+  };
   const result = await generateAction(person, cs.people, {
     timeOfDay: cs.timeOfDay, weather: cs.weather, day: cs.day,
     hour: cs.hour, minute: cs.minute,
@@ -2328,7 +2679,11 @@ export async function runAIAction(gameRef, personIdx, signal) {
     wildlife: cs.wildlife, buildings: cs.buildings, field: cs.field,
     learned: qBestActions(person, cs, 3),       // System 5: what's been paying off
     specialty: topSkill(person),                 // specialization identity
+    reputation: cs.reputation,                   // collective standing of everyone (#2)
+    myReputation: reputationLabel(cs, person.name), // how the village sees you
+    specialists,                                 // village go-to people by role (#5)
   }, signal);
+  recordModelResult(cs, person.model, !!result); // track model reliability (#8)
   if (!result) return;
 
   person.mood = result.mood || person.mood;

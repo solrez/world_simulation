@@ -88,6 +88,7 @@ function App() {
         rendererRef.current.updateBubbles(next.activeConversations, next.people);
         rendererRef.current.updateCampfire();
         rendererRef.current.updateField(next.field);
+        rendererRef.current.updateEnvironment(next);
         rendererRef.current.updateDayNight(next.timeOfDay, next.hour + next.minute / 60);
         rendererRef.current.updateWeather(next.weather);
         rendererRef.current.updateTrails(next.people);

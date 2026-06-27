@@ -27,6 +27,22 @@ function formatMemories(person, limit = 6) {
   return person.memories.slice(-limit).map(m => `[Day ${m.day}] ${m.text}`).join('\n');
 }
 
+// Memories the speaker shares with a specific person — the raw material for
+// "remember when..." references in dialogue (#3). Surfaces memories that name the
+// person, plus heavy collective events (deaths, dangers, near-starvation) that
+// everyone present lived through. Ranked by current decayed weight.
+function getSharedExperiences(person, otherName, limit = 3) {
+  if (!person.memories?.length) return '';
+  const COLLECTIVE = new Set(['death', 'danger']);
+  const scored = person.memories
+    .filter(m => (m.text && m.text.includes(otherName)) || COLLECTIVE.has(m.type))
+    .map(m => ({ m, w: m.weight ?? Math.abs(m.valence ?? 0) }))
+    .sort((a, b) => b.w - a.w)
+    .slice(0, limit)
+    .map(({ m }) => `[Day ${m.day}] ${m.text}`);
+  return scored.join('\n');
+}
+
 // Summarize how the person feels about places based on anchored memories.
 // Informs the LLM without forcing it — the model can still choose to go anywhere.
 function formatPlaceFeelings(person) {
@@ -58,7 +74,22 @@ function describeActivity(p) {
   return p.activity || 'idle';
 }
 
+// The single word the village most associates with someone, from a reputation
+// record { generous, kind, skilled, reliable, brave }. Mirrors the sim's own
+// reputationLabel (kept here to avoid a circular import).
+const REP_POS = { generous: 'generous', kind: 'kind', skilled: 'highly skilled', reliable: 'dependable', brave: 'brave' };
+const REP_NEG = { generous: 'selfish', kind: 'cold', skilled: 'unskilled', reliable: 'unreliable', brave: 'timid' };
+function repLabelFrom(rec) {
+  if (!rec) return null;
+  let best = null, mag = 12;
+  for (const d of Object.keys(REP_POS)) {
+    if (Math.abs(rec[d] || 0) > mag) { mag = Math.abs(rec[d]); best = { d, v: rec[d] }; }
+  }
+  return best ? (best.v > 0 ? REP_POS[best.d] : REP_NEG[best.d]) : null;
+}
+
 function describeWorld(person, allPeople, state) {
+  const reputation = state.reputation || {};
   const others = allPeople
     .filter(p => p.name !== person.name && p.alive !== false)
     .map(p => {
@@ -69,6 +100,10 @@ function describeWorld(person, allPeople, state) {
       if (rel?.affection > 65) extras.push('close');
       if (rel?.attraction > 60) extras.push('attracted');
       if (p.sick) extras.push('sick');
+      if (p.injury > 25) extras.push('injured');
+      // private belief (gossip-shaped) takes priority over the village consensus
+      const rep = repLabelFrom(person.reputationBeliefs?.[p.name]) || repLabelFrom(reputation[p.name]);
+      if (rep) extras.push(`known as ${rep}`);
       const ex = extras.length ? ` (${extras.join(', ')})` : '';
       return `${p.name} — ${stage}${ex}, at ${p.currentLocation}, ${describeActivity(p)}`;
     }).join('\n');
@@ -130,6 +165,7 @@ You're being asked to decide because something INTERESTING is happening — a ch
 - Sometimes just do nothing — sit, think, wander aimlessly. Real people don't optimize every minute.
 
 ${worldState.specialty ? `You've become the village's go-to for ${worldState.specialty} — it's part of who you are now.` : ''}
+${worldState.myReputation ? `Around the village, people think of you as ${worldState.myReputation}. That reputation follows you.` : ''}
 You can also UPDATE YOUR GOALS if they no longer make sense. Drop goals that feel wrong, add new ones based on what's happened to you.`;
 
   const learnedStr = (worldState.learned || []).filter(l => Math.abs(l.value) > 0.3)
@@ -144,10 +180,18 @@ You can also UPDATE YOUR GOALS if they no longer make sense. Drop goals that fee
       ? 'The field is RIPE — ready to harvest for crops!'
       : `The field is sown and ${Math.round(f.stage * 100)}% grown — it could use tending.`;
 
+  const sp = worldState.specialists || {};
+  const spLines = [];
+  if (sp.healer) spLines.push(`best healer: ${sp.healer}`);
+  if (sp.hunter) spLines.push(`best hunter: ${sp.hunter}`);
+  if (sp.builder) spLines.push(`best builder: ${sp.builder}`);
+  if (sp.forager) spLines.push(`best forager: ${sp.forager}`);
+  const specialistStr = spLines.length ? spLines.join(', ') : '';
+
   const userPrompt = `CURRENT SITUATION:
 Location: ${person.currentLocation || 'settlement'}.
 Time: ${worldState.timeOfDay} (${worldState.hour}:${String(worldState.minute).padStart(2,'0')}), Day ${worldState.day}, ${worldState.season}. Weather: ${worldState.weather}.
-Village larder: ${larderStr}.${fieldStr ? `\nThe Field: ${fieldStr}` : ''}${learnedStr ? `\nWHAT YOU'VE LEARNED works ${worldState.season}: ${learnedStr}.` : ''}
+Village larder: ${larderStr}.${fieldStr ? `\nThe Field: ${fieldStr}` : ''}${learnedStr ? `\nWHAT YOU'VE LEARNED works ${worldState.season}: ${learnedStr}.` : ''}${specialistStr ? `\nWHO THE VILLAGE RELIES ON — ${specialistStr}. If you need help (sick, hungry, building), it makes sense to seek the right person.` : ''}
 
 PEOPLE:
 ${world.others || 'Nobody around.'}
@@ -203,8 +247,15 @@ export async function generateGroupDialogue(speaker, otherParticipants, allPeopl
     if (rel.attraction > 65) feelings.push('attracted');
     if (speaker.partner === p.name) feelings.push('partner');
     if (rel.jealousy > 40) feelings.push('jealous');
+    const rep = repLabelFrom(speaker.reputationBeliefs?.[p.name]);
+    if (rep) feelings.push(`you think of them as ${rep}`);
     return `${p.name} (${p.gender}, ${p.age}) — ${rel.stage || 'stranger'}${feelings.length ? ', ' + feelings.join(', ') : ''}. Currently ${describeActivity(p)}.`;
   }).join('\n');
+
+  // shared history with each person — the raw material for "remember when..."
+  const sharedHistory = otherParticipants
+    .map(p => { const s = getSharedExperiences(speaker, p.name); return s ? `With ${p.name}:\n${s}` : ''; })
+    .filter(Boolean).join('\n\n');
 
   const systemPrompt = `You ARE ${speaker.name}. You are talking with people in your settlement. Be completely natural — talk like a REAL person, not a character in a story.
 
@@ -228,8 +279,11 @@ STAY GROUNDED — this is a small primitive settlement. Only mention things that
 actually exist here: the people listed, the places (Campfire, Grove, Meadow,
 Berry Bush, Fishing Spot, Pond, Well, Rock Seat, Field), real food (berries,
 fish, meat, crops), wood/stone/thatch, the weather and season. DO NOT invent
-feasts, festivals, gods, religions, towns, shops, mythical creatures, or past
-events that aren't in your memories. If you feel a "divine presence," it's only
+feasts, festivals, gods, religions, towns, shops, or mythical creatures.
+You CAN bring up shared history — but ONLY events that appear in your memories or
+the "THINGS YOU'VE BEEN THROUGH TOGETHER" list below ("remember the winter we
+nearly starved?", "you've seemed different since the wolf"). Never invent a past
+event that isn't written there. If you feel a "divine presence," it's only
 because something genuinely strange just happened — don't manufacture it.`;
 
   const userPrompt = `TALKING WITH:
@@ -239,7 +293,7 @@ WHERE: ${context}
 
 PAST CONVERSATIONS WITH THESE PEOPLE:
 ${pastConvos}
-
+${sharedHistory ? `\nTHINGS YOU'VE BEEN THROUGH TOGETHER (you may reference these naturally — "remember when...", "you've been different since..."):\n${sharedHistory}\n` : ''}
 ${history.length > 0
   ? `THIS CONVERSATION SO FAR:\n${history.slice(-10).map(h => `${h.speaker}: ${h.text}`).join('\n')}\n\n${history[history.length - 1].speaker} just said: "${history[history.length - 1].text}"\nRESPOND DIRECTLY to that — answer their question, react to what they said, or build on it. Do NOT start a fresh greeting or repeat an earlier line. This is a back-and-forth, not a monologue.`
   : 'You just ran into each other. Say something natural — a greeting, a comment, or a question to get them talking.'}
@@ -266,6 +320,48 @@ JSON:
   if (!result || typeof result.dialogue !== 'string' || !result.dialogue.trim()) return null;
   history.push({ speaker: speaker.name, text: result.dialogue, thought: result.internal_thought });
   if (history.length > 30) history.splice(0, history.length - 30);
+  return result;
+}
+
+// ── GOSSIP (#2) ──
+// The speaker passes along their read on an absent third party. The returned
+// `lean` lets the listener nudge their own belief toward the speaker's view —
+// this is how reputation spreads (and distorts) without direct interaction.
+export async function generateGossip(speaker, listener, absentName, state, signal) {
+  const belief = repLabelFrom(speaker.reputationBeliefs?.[absentName]) || repLabelFrom((state.reputation || {})[absentName]);
+  const rel = speaker.relationships?.[absentName] || {};
+  const feel = rel.affection > 60 ? 'you like them' : rel.affection < 30 ? 'you don\'t much like them' : 'you\'re neutral on them';
+  const systemPrompt = `You ARE ${speaker.name} (${speaker.traits.join(', ')}). How you talk: ${speaker.speechStyle}
+You're talking with ${listener.name} and ${absentName} isn't here. People talk about each other when they're not around — that's just village life. Share what you actually think of ${absentName}.`;
+  const userPrompt = `What you currently think of ${absentName}: ${belief ? `known to you as ${belief}` : 'no strong opinion yet'} (${feel}).
+Say one natural, in-character line of gossip about ${absentName} to ${listener.name} — an opinion, a complaint, a bit of praise, or a worry. Keep it grounded in this small settlement.
+
+JSON:
+{
+  "dialogue": "what you say about ${absentName}",
+  "lean": "positive/negative/neutral",
+  "about": "${absentName}"
+}`;
+  const result = await callLLM(systemPrompt, userPrompt, 0.95, 200, 'gossip', signal, speaker.model);
+  if (!result || typeof result.dialogue !== 'string' || !result.dialogue.trim()) return null;
+  return result;
+}
+
+// ── TEACHING (#7) ──
+// An expert gives a novice a short lesson in a skill. Flavorful, and the caller
+// rewards the novice's skill on a usable exchange.
+export async function generateTeaching(teacher, student, skill, signal) {
+  const systemPrompt = `You ARE ${teacher.name} (${teacher.traits.join(', ')}). How you talk: ${teacher.speechStyle}
+You are the village's best at ${skill} (skill ${Math.round(teacher.skills?.[skill] || 0)}/100). ${student.name} is still learning it. Pass on something real and practical — the kind of tip you only know from doing it. Stay grounded in this primitive settlement.`;
+  const userPrompt = `Teach ${student.name} one concrete thing about ${skill}, in your own voice. 1-2 sentences.
+
+JSON:
+{
+  "dialogue": "what you say while teaching",
+  "tip": "the practical lesson in a few words"
+}`;
+  const result = await callLLM(systemPrompt, userPrompt, 0.9, 200, 'teach', signal, teacher.model);
+  if (!result || typeof result.dialogue !== 'string' || !result.dialogue.trim()) return null;
   return result;
 }
 
