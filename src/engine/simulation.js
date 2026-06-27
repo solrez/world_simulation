@@ -1,5 +1,6 @@
-import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, SKILLS, AMBIENT_EVENTS, BUILD_REQUIREMENTS, BUILD_PHASES, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE } from '../utils/constants.js';
+import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, SKILLS, AMBIENT_EVENTS, BUILD_REQUIREMENTS, BUILD_PHASES, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, MODEL_POOL } from '../utils/constants.js';
 import { buildWalkableGrid, findPath, nearestWalkable } from './pathfinding.js';
+import { nearestVisiblePrey } from './vision.js';
 import { generateGroupDialogue, generateAction } from './ai.js';
 
 // ── Conversation Archive (persisted to localStorage) ──
@@ -105,6 +106,9 @@ function generateTerrain() {
       if (px * px + py * py < 6) type = TERRAIN.WATER;
       const dx = x - 14, dy = y - 10;
       if (Math.sqrt(dx * dx + dy * dy) < 1.5) type = TERRAIN.DIRT;
+      // tilled field plot around the Field location
+      const fx = x - LOCATIONS.FIELD.x, fy = y - LOCATIONS.FIELD.y;
+      if (Math.abs(fx) <= 2 && Math.abs(fy) <= 1) type = TERRAIN.DIRT;
       if (y === 10 && x >= 12 && x <= 16) type = TERRAIN.PATH;
       if (x === 14 && y >= 8 && y <= 12) type = TERRAIN.PATH;
       if ((x + y * 7) % 13 === 0 && type === TERRAIN.GRASS) type = TERRAIN.FLOWERS;
@@ -117,6 +121,7 @@ function generateTerrain() {
     [LOCATIONS.CAMPFIRE, LOCATIONS.MEADOW], [LOCATIONS.WELL, LOCATIONS.POND],
     [LOCATIONS.CAMPFIRE, LOCATIONS.ROCK_SEAT], [LOCATIONS.CAMPFIRE, LOCATIONS.BERRY_BUSH],
     [LOCATIONS.WELL, LOCATIONS.FISHING_SPOT],
+    [LOCATIONS.CAMPFIRE, LOCATIONS.FIELD],
   ];
   for (const [a, b] of pathPairs) {
     const steps = Math.max(Math.abs(b.x - a.x), Math.abs(b.y - a.y));
@@ -188,6 +193,9 @@ function initPerson(config, index, startX, startY) {
     targetX: null, targetY: null,
     path: null, _pathDest: null,
     currentLocation: 'village',
+    // the LLM this agent "thinks" with — distinct model = distinct voice. A child
+    // may inherit its model below; otherwise pick randomly from the pool.
+    model: config.model || MODEL_POOL[Math.floor(Math.random() * MODEL_POOL.length)],
     lifeStage: getLifeStage(config.age),
     mood: 'neutral',
     activity: 'exploring',
@@ -224,7 +232,7 @@ function initPerson(config, index, startX, startY) {
     // behavior lock
     currentGoal: null,
     // skills
-    skills: { fishing: 0, building: 0, foraging: 0, storytelling: 0, healing: 0, crafting: 0 },
+    skills: { fishing: 0, building: 0, foraging: 0, storytelling: 0, healing: 0, crafting: 0, hunting: 0, farming: 0 },
     // alive
     alive: true,
     // ambitions — generated at init
@@ -303,6 +311,8 @@ export function createSimulation() {
     // shared village larder (typed) + resource-patch depletion state
     larder: { meat: 8, fish: 12, berries: 20, crops: 6 },
     patches: { 'Berry Bush': 1, 'Fishing Spot': 1, 'Meadow': 1 },
+    // the communal field: fallow to start, waiting for someone to sow it
+    field: { planted: false, stage: 0, plantedDay: null },
     stats: { totalBirths: 0, totalDeaths: 0, totalPartnerships: 0, totalConversations: 0 },
     events: [], conversations: [], activeConversations: [],
     nextConvoId: 1, tick: 0, speed: 1, paused: false,
@@ -418,6 +428,75 @@ function updateWildlife(state) {
   }
 }
 
+// ── Hunting: continuous active pursuit ──
+//
+// A hunter doesn't aim at a stale snapshot. Every tick, while activity is
+// 'hunting', they look for prey IN SIGHT (vision), lock onto the nearest, and
+// chase its LIVE position — which keeps moving because the animal flees (see
+// updateWildlife's fleeRange). They only catch it when they close the gap. This
+// is the whole point of giving agents eyes: the world moves, and they react to
+// where things actually are, not where they were when the hunt began.
+function processHunting(person, state) {
+  if (person.activity !== 'hunting') return;
+  if (person.sleeping || person.eating || person.conversationId) { person.activity = 'idle'; return; }
+
+  // re-acquire a target each tick from what's actually visible
+  const tooHard = (person.skills?.hunting || 0) < 8; // novices avoid wolves
+  let prey = person._huntTargetId != null
+    ? (state.wildlife || []).find(w => w.id === person._huntTargetId && w.alive)
+    : null;
+  // if we lost sight of our quarry (it fled out of view), look for another
+  if (!prey || distBetween(person, prey) > 12) {
+    prey = nearestVisiblePrey(person, state, { allowDangerous: !tooHard });
+    person._huntTargetId = prey ? prey.id : null;
+  }
+
+  if (!prey) {
+    // nothing in sight — roam toward open ground to scan for game, give up after a while
+    person._huntScan = (person._huntScan || 0) + 1;
+    if (person._huntScan > 40) { person.activity = 'idle'; person._huntScan = 0; person.thought = 'No game in sight. Giving up the hunt.'; return; }
+    if (person.targetX === null) { goToLocation(person, 'Grove'); }
+    return;
+  }
+  person._huntScan = 0;
+
+  const d = distBetween(person, prey);
+  if (d < 1.6) {
+    // close enough to strike
+    const huntSkill = person.skills?.hunting || 0;
+    const seasonHunt = (SEASON_ABUNDANCE[state.season] || { hunt: 1 }).hunt;
+    const catchChance = (0.30 + huntSkill * 0.006) * seasonHunt;
+    if (Math.random() < catchChance) {
+      prey.alive = false;
+      const meat = Math.max(2, Math.round(prey.foodValue));
+      addFood(person, 'meat', meat);
+      person.foodGathered = (person.foodGathered || 0) + meat;
+      gainSkill(person, 'hunting', 1);
+      rewardAction(person, 'hunt', meat, state);
+      setEmote(person, 'sparkle', 20);
+      person.activity = 'idle'; person._huntTargetId = null;
+      person.thought = `Got the ${prey.type}! ${meat} meat.`;
+      addMemory(person, `Caught a ${prey.type}! Got ${meat} meat.`, 'achievement', state.day, { location: person.currentLocation });
+      state.events.push({ day: state.day, hour: state.hour, participants: [person.name], summary: `🏹 ${person.name} caught a ${prey.type}!`, type: 'hunt' });
+    } else if (prey.dangerous && Math.random() < 0.25) {
+      // dangerous prey fights back — real risk the Q-table learns to weigh
+      person.hunger = Math.min(100, person.hunger + 8);
+      person.tiredness = Math.min(100, person.tiredness + 8);
+      setEmote(person, 'fear', 20);
+      rewardAction(person, 'hunt', -3, state);
+      person.activity = 'idle'; person._huntTargetId = null;
+      addMemory(person, `A ${prey.type} fought back while hunting!`, 'danger', state.day, { location: person.currentLocation });
+    }
+    // a miss just continues the chase next tick
+  } else {
+    // pursue the LIVE position — this is the chase. Pathfind around water.
+    person.targetX = prey.x;
+    person.targetY = prey.y;
+    moveToward(person, prey.x, prey.y, state);
+    person.tiredness = Math.min(100, person.tiredness + 0.01); // chasing tires you
+  }
+}
+
 // ── Helpers ──
 
 function getTimeOfDay(hour) {
@@ -504,8 +583,16 @@ function goToPerson(person, target) {
 // Which productive action to do, ε-greedy over learned Q-values. This is the
 // local adaptation between LLM calls: agents lean into what's worked, but still
 // explore (Q_EPSILON) so they discover hunting/building pay off.
-const WORK_ACTIONS = ['fish', 'forage', 'hunt', 'chop_wood'];
+const WORK_ACTIONS = ['fish', 'forage', 'hunt', 'chop_wood', 'farm'];
 function pickWorkAction(person, state) {
+  // a ripe field is free food — go reap it; a fallow field in a growing season
+  // is worth sowing so the crop cycle keeps going (otherwise it dies after one
+  // harvest because nobody re-plants). Both bias toward farming, with some noise.
+  const f = state.field;
+  if (f) {
+    if (f.planted && f.stage >= FARM.RIPE && Math.random() < 0.7) return 'farm';
+    if (!f.planted && FARM.GROW_SEASONS.includes(state.season) && Math.random() < 0.3) return 'farm';
+  }
   if (Math.random() < Q_EPSILON) return WORK_ACTIONS[Math.floor(Math.random() * WORK_ACTIONS.length)];
   let best = WORK_ACTIONS[0], bestV = -Infinity;
   for (const a of WORK_ACTIONS) {
@@ -519,11 +606,22 @@ function startWorkAction(person, action, state) {
     fish: ['Fishing Spot', 'gathering'],
     forage: ['Berry Bush', 'gathering'],
     chop_wood: ['Grove', 'chopping'],
+    farm: ['Field', 'farming'],
   };
   if (action === 'hunt') {
-    const prey = (state.wildlife || []).find(w => w.alive);
-    if (prey) { person.targetX = prey.x; person.targetY = prey.y; person.activity = 'hunting'; setGoal(person, 'hunt', prey.type, 80); return; }
-    action = 'forage'; // nothing to hunt → fall back
+    // begin a hunt — processHunting takes over each tick, finding prey via sight
+    // and chasing it. Don't lock a goal (that would freeze the pursuit).
+    const tooHard = (person.skills?.hunting || 0) < 8;
+    const prey = nearestVisiblePrey(person, state, { allowDangerous: !tooHard })
+      || (state.wildlife || []).find(w => w.alive); // none in sight → go look near one
+    if (prey) {
+      person.activity = 'hunting';
+      person._huntTargetId = null; person._huntScan = 0;
+      person.targetX = prey.x; person.targetY = prey.y;
+      person.thought = 'Spotted something to hunt...';
+      return;
+    }
+    action = 'forage'; // genuinely no animals anywhere → fall back
   }
   const [loc, act] = map[action] || map.forage;
   goToLocation(person, loc);
@@ -792,6 +890,11 @@ function updateNeeds(person, timeOfDay, weather) {
     person.loneliness = clamp(person.loneliness + rate, 0, 100);
   }
 
+  // awe (sense of the divine) fades when the gods stay quiet — it's only renewed
+  // by an actual god-power. So "something divine is watching" reflects RECENT
+  // intervention, not a permanent religion the agents invent on their own.
+  if (person.awe > 0) person.awe = Math.max(0, person.awe - 0.02);
+
   // eating — consumes from personal food or village food
   if (person.eating) {
     person.hunger = clamp(person.hunger - 0.8, 0, 100);
@@ -815,18 +918,26 @@ function updateNeeds(person, timeOfDay, weather) {
 // This removes the old three-way race (needs + schedule + LLM all firing on the
 // same tick) and stops spending LLM calls on reflexes that have one answer.
 function escalationGate(person, people, state) {
-  if (person.conversationId || person.sleeping || person.eating) return { verdict: 'IDLE' };
   if (person.lifeStage === LIFE_STAGES.BABY) return { verdict: 'IDLE' };
-  if (person.currentGoal && person.currentGoal.until > 0) return { verdict: 'IDLE' };
+  // already acting on a reflex — let it run
+  if (person.sleeping || person.eating) return { verdict: 'IDLE' };
 
   // ── reflexes: single-answer survival, handled locally ──
+  // These are INSTINCTIVE and fire even mid-conversation: a starving or
+  // exhausted person breaks off and tends to their body. runConversation checks
+  // for this and bails the talker out, so nobody dies mid-sentence.
   if (person.tiredness > GATE.EXHAUSTED) return { verdict: 'REFLEX', reflex: 'sleep' };
-  if (state.timeOfDay === 'night' && person.tiredness > GATE.NIGHT_TIRED && !person.targetX) {
+  if (state.timeOfDay === 'night' && person.tiredness > GATE.NIGHT_TIRED && !person.targetX && !person.conversationId) {
     return { verdict: 'REFLEX', reflex: 'sleep' };
   }
   if (person.sick && person.tiredness > GATE.SICK_TIRED) return { verdict: 'REFLEX', reflex: 'sleep' };
   if (person.hunger > GATE.STARVING) return { verdict: 'REFLEX', reflex: 'eat' };
-  if (state.weather === 'storm') return { verdict: 'REFLEX', reflex: 'shelter' };
+  if (state.weather === 'storm' && !person.conversationId) return { verdict: 'REFLEX', reflex: 'shelter' };
+
+  // beyond survival reflexes, a conversation suppresses escalation/social logic
+  // (the LLM is already driving the talk) and any in-progress goal owns the tick
+  if (person.conversationId) return { verdict: 'IDLE' };
+  if (person.currentGoal && person.currentGoal.until > 0) return { verdict: 'IDLE' };
 
   // ── escalation triggers (skip while on cooldown) ──
   if (person.gateCooldown <= 0) {
@@ -864,16 +975,27 @@ function escalationGate(person, people, state) {
       return { verdict: 'ESCALATE' };
     }
 
-    // 5. homeless adult, especially with winter coming — building is now a real
-    //    survival choice (and the Q-table has learned it pays off)
-    if (!person.home && person.lifeStage === LIFE_STAGES.ADULT && !person.buildProject &&
-        (state.season === 'fall' || state.season === 'winter') && Math.random() < 0.05) {
-      return { verdict: 'ESCALATE' };
+    // 5. a homeless adult wanting shelter — a real survival/comfort choice in ANY
+    //    season (everyone wants a home; fall/winter just makes it urgent). Higher
+    //    chance as cold approaches so houses actually get built before winter.
+    if (!person.home && person.lifeStage === LIFE_STAGES.ADULT && !person.buildProject) {
+      const urgency = (state.season === 'fall' || state.season === 'winter') ? 0.06 : 0.025;
+      if (Math.random() < urgency) return { verdict: 'ESCALATE' };
     }
 
     // 6. hungry and hunting has paid off lately → consider a hunt
     if (person.hunger >= GATE.HUNGER_BAND[0] && qValue(person, state, 'hunt') > qValue(person, state, 'forage') &&
         Math.random() < 0.1) {
+      return { verdict: 'ESCALATE' };
+    }
+
+    // 7. the field is ripe (food just sitting there) or fallow in a growing
+    //    season — either is a real "should I go work the field?" decision.
+    if (fieldReady(state) && Math.random() < 0.12) {
+      return { verdict: 'ESCALATE' };
+    }
+    if (state.field && !state.field.planted && FARM.GROW_SEASONS.includes(state.season) &&
+        totalFood(state) < 25 && Math.random() < 0.04) {
       return { verdict: 'ESCALATE' };
     }
   }
@@ -883,6 +1005,14 @@ function escalationGate(person, people, state) {
 
 // Apply a single-answer reflex locally — no LLM, no discretion.
 function applyReflex(person, reflex, state) {
+  // survival reflexes are instinctive and break off a conversation: you can't
+  // keep chatting when your body is screaming to eat or sleep. The conversation
+  // loop sees the cleared conversationId next line and drops this speaker.
+  if ((reflex === 'eat' || reflex === 'sleep') && person.conversationId) {
+    person._leftConversation = person.conversationId;
+    person.conversationId = null;
+    person.conversationCooldown = 6 + Math.floor(Math.random() * 6);
+  }
   switch (reflex) {
     case 'sleep': {
       person.sleeping = true;
@@ -899,12 +1029,33 @@ function applyReflex(person, reflex, state) {
         person.eating = true; person.activity = 'eating';
         setEmote(person, 'eat', 30); setGoal(person, 'eat', null, 30);
         rewardAction(person, 'forage', relief / 20, state); // satisfying a need pays off
-      } else {
-        // nothing on hand or in the larder — go produce some
-        const foodLocs = Object.values(LOCATIONS).filter(l => l.type === 'food');
-        const loc = weightedLocationPick(person, foodLocs.map(l => l.name));
-        if (loc) { goToLocation(person, loc); person.activity = 'gathering'; setGoal(person, 'work', loc, 100); }
+        break;
       }
+      // Nothing on hand or in the larder — go GET food by whatever means. This is
+      // instinctive, so we pick the best available producer, not just berries:
+      //   1. a ripe field right there → harvest it (free, big yield)
+      //   2. hunting if it's paid off lately and there's prey → meat
+      //   3. otherwise the nearest food patch (berries / fish), memory-weighted
+      if (fieldReady(state)) {
+        goToLocation(person, 'Field'); person.activity = 'farming'; setGoal(person, 'farm', 'Field', 120);
+        person.thought = 'Starving — the field is ripe, time to harvest.';
+        break;
+      }
+      // hunt only what you can actually SEE — a hungry forager won't magically
+      // know where distant game is. processHunting then runs the chase.
+      const tooHard = (person.skills?.hunting || 0) < 8;
+      const prey = nearestVisiblePrey(person, state, { allowDangerous: !tooHard });
+      const huntPays = qValue(person, state, 'hunt') >= qValue(person, state, 'forage');
+      if (prey && (huntPays || (person.skills?.hunting || 0) > 5)) {
+        person.activity = 'hunting';
+        person._huntTargetId = prey.id; person._huntScan = 0;
+        person.targetX = prey.x; person.targetY = prey.y;
+        person.thought = `Hungry — going after that ${prey.type}.`;
+        break;
+      }
+      const foodLocs = Object.values(LOCATIONS).filter(l => l.type === 'food');
+      const loc = weightedLocationPick(person, foodLocs.map(l => l.name));
+      if (loc) { goToLocation(person, loc); person.activity = 'gathering'; setGoal(person, 'work', loc, 100); }
       break;
     }
     case 'shelter': {
@@ -1130,6 +1281,8 @@ function spawnChild(mother, father, people, state) {
     values: Math.random() < 0.5 ? mother.values : (father?.values || ['curiosity']),
     quirks: 'babbles, cries when hungry', background: `Child of ${mother.name} and ${father?.name || 'unknown'}.`,
     speechStyle: 'baby sounds', parents: [mother.name, father?.name].filter(Boolean), children: [],
+    // a child "learns to speak" with a parent's model (its inherited voice)
+    model: Math.random() < 0.5 ? mother.model : (father?.model || mother.model),
   }, nextPersonId++, mother.x, mother.y);
   child.parents = [mother.name, father?.name].filter(Boolean);
   mother.children.push(name);
@@ -1174,6 +1327,10 @@ export function simulateTick(state) {
     updateMoodFromNeeds(person);
     updateJealousy(person, alivePeople);
     updateSkills(person, next);
+    // continuous active pursuit — runs every tick a person is hunting, chasing
+    // the prey's LIVE position via vision. Independent of the goal lock so it
+    // actually completes (the old one-shot hunt never could).
+    processHunting(person, next);
     if (dayRolled) decayMemories(person, next);
     processBreakups(person, alivePeople, next);
     processIllness(person, next);
@@ -1249,12 +1406,22 @@ export function simulateTick(state) {
       // leave the slot open for the LLM — don't run the local schedule this tick
     }
 
+    // an active hunter already moved itself this tick (processHunting chases the
+    // live prey position); don't double-move it here. A survival reflex above can
+    // still flip activity away from 'hunting' and reclaim control.
+    if (person.activity === 'hunting' && gate.verdict !== 'REFLEX') {
+      person.currentLocation = locationAt(person.x, person.y);
+      continue;
+    }
+
     if (person.targetX !== null) {
       const arrived = moveToward(person, person.targetX, person.targetY, next);
       if (arrived) {
         person.currentLocation = locationAt(person.x, person.y);
         person.idle = 0;
-        if (person.hunger > 40) {
+        // opportunistic auto-eat on arrival — but NOT while in a conversation
+        // (that would silently pull them out and kill the dialogue after 1 line)
+        if (person.hunger > 40 && !person.conversationId) {
           const foodLocs = Object.values(LOCATIONS).filter(l => l.type === 'food');
           if (foodLocs.some(l => l.name === person.currentLocation)) {
             person.eating = true; person.activity = 'eating';
@@ -1367,6 +1534,17 @@ function regrowPatches(state) {
   }
 }
 
+// ── Farming: the communal field grows over days, only in growing seasons ──
+// Sown crops creep forward on their own each day; tending (a work action) speeds
+// it. Winter freezes progress so a field sown too late just sits — Q learns that.
+function growField(state) {
+  const f = state.field;
+  if (!f || !f.planted) return;
+  if (!FARM.GROW_SEASONS.includes(state.season)) return; // frozen in winter
+  f.stage = Math.min(FARM.RIPE, f.stage + FARM.PASSIVE_GROW_PER_DAY);
+}
+function fieldReady(state) { return state.field?.planted && state.field.stage >= FARM.RIPE; }
+
 // ── Q-learning-lite: agents learn which actions pay off, per season ──
 // Coarse context keeps the table tiny so it learns fast and stays inspectable.
 function qContext(person, state) {
@@ -1448,6 +1626,42 @@ function updateSkills(person, state) {
       rewardAction(person, 'chop_wood', 1, state);
       person.thought = `Chopped a log! (${person.inventory.wood} total)`;
       setEmote(person, 'sparkle', 8);
+    }
+  }
+
+  // farming at the Field — sow / tend / harvest depending on field state. This
+  // is the one productive action with a multi-day payoff: you sow, it grows over
+  // days (only in growing seasons), you tend it to speed it, then harvest crops.
+  if ((person.activity === 'farming' || person.activity === 'working') && loc === 'Field') {
+    const f = state.field || (state.field = { planted: false, stage: 0, plantedDay: null });
+    if (!f.planted) {
+      // sow the fallow field — quick, but futile in winter (Q will learn this)
+      f.planted = true;
+      f.stage = 0;
+      f.plantedDay = state.day;
+      gainSkill(person, 'farming', 0.1);
+      const winter = !FARM.GROW_SEASONS.includes(state.season);
+      rewardAction(person, 'farm', winter ? -1 : 1, state); // sowing into frost rarely pays
+      person.thought = winter ? 'Sowing now, in winter? Nothing will grow...' : 'Sowed the field. Now to wait for it to grow.';
+      setEmote(person, 'sparkle', 6);
+    } else if (f.stage >= FARM.RIPE) {
+      // harvest! big typed-crop yield scaled by farming skill
+      const yield_ = Math.round(FARM.BASE_YIELD + person.skills.farming * FARM.SKILL_YIELD);
+      addFood(person, 'crops', yield_);
+      person.foodGathered += yield_;
+      gainSkill(person, 'farming', 1);
+      rewardAction(person, 'farm', yield_, state);
+      addMemory(person, `Harvested ${yield_} crops from the field!`, 'achievement', state.day, { location: 'Field' });
+      state.events.push({ day: state.day, hour: state.hour, participants: [person.name], summary: `🌾 ${person.name} harvested the field!`, type: 'harvest' });
+      setEmote(person, 'sparkle', 20);
+      person.thought = `Harvested ${yield_} crops!`;
+      f.planted = false; f.stage = 0; f.plantedDay = null; // back to fallow
+    } else if (Math.random() < 0.05) {
+      // tend the growing crop — nudges it toward ripe, small skill + reward
+      f.stage = Math.min(FARM.RIPE, f.stage + FARM.TEND_GAIN);
+      gainSkill(person, 'farming', 0.08);
+      rewardAction(person, 'farm', 0.5, state);
+      person.thought = `Tending the crops (${Math.round(f.stage * 100)}% grown).`;
     }
   }
 
@@ -1639,6 +1853,7 @@ function processResources(state, dayRolled) {
       if (rot > 0) state.larder[t] = Math.max(0, state.larder[t] - rot);
     }
     regrowPatches(state);
+    growField(state);
   }
   // famine: empty larder makes everyone hungrier faster
   if (totalFood(state) <= 0) {
@@ -1845,7 +2060,9 @@ function processSeasonalEvents(state) {
 export function findConversationGroup(people) {
   const available = people.filter(p =>
     p.alive !== false && !p.conversationId && p.conversationCooldown <= 0 &&
-    !p.sleeping && !p.eating && p.lifeStage !== LIFE_STAGES.BABY
+    !p.sleeping && !p.eating && p.lifeStage !== LIFE_STAGES.BABY &&
+    // a starving or exhausted person has no business chatting — survival first
+    p.hunger <= GATE.STARVING && p.tiredness <= GATE.EXHAUSTED
   );
   if (available.length < 2) return null;
   for (const anchor of available) {
@@ -1855,6 +2072,19 @@ export function findConversationGroup(people) {
     return group.map(p => people.indexOf(p));
   }
   return null;
+}
+
+// Reject dialogue that won't read right: too short, or not predominantly latin
+// script (some pool models occasionally drift into Chinese/other scripts). We
+// don't need perfect language detection — just "is this mostly English letters".
+function isUsableDialogue(text) {
+  if (!text || text.length < 2) return false;
+  const letters = (text.match(/[a-zA-Z]/g) || []).length;
+  // any CJK / Hangul (unified ideographs, CJK symbols, Hangul) → reject outright
+  const cjk = (text.match(/[\u3000-\u303f\u3400-\u9fff\uac00-\ud7af\uff00-\uffef]/g) || []).length;
+  if (cjk > 0) return false;
+  const alnum = (text.match(/[a-zA-Z0-9]/g) || []).length;
+  return letters >= 3 && alnum / text.length > 0.4; // mostly real words
 }
 
 export async function runConversation(gameRef, participantIndices, onUpdate, signal) {
@@ -1879,14 +2109,37 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
   gameRef.current = { ...gameRef.current, activeConversations: [...gameRef.current.activeConversations, conversation] };
   onUpdate();
 
-  // shorter conversations — 2-4 lines per person
-  const totalLines = participants.length * (2 + Math.floor(Math.random() * 3));
+  // target lines = 2-4 per person. We count PRODUCED lines, not attempts, so a
+  // flaky model failing a turn doesn't silently burn the whole conversation.
+  const targetLines = participants.length * (2 + Math.floor(Math.random() * 3));
   let lastSpeakerIdx = -1;
   const speakCount = new Map(participants.map(p => [p.name, 0]));
+  // a per-speaker failure tally — someone whose model keeps failing gets skipped
+  const failCount = new Map(participants.map(p => [p.name, 0]));
+  let produced = 0;
+  let attempts = 0;
+  const maxAttempts = targetLines * 3; // generous headroom for retries
 
-  for (let t = 0; t < totalLines; t++) {
+  while (produced < targetLines && attempts < maxAttempts) {
+    attempts++;
+    // Someone who broke off via a survival reflex sets _leftConversation. Narrate
+    // their exit once; only END the conversation if fewer than 2 people remain.
+    const quitter = participants.find(p => p._leftConversation === convoId);
+    if (quitter) {
+      conversation.lines.push({ speaker: 'narrator', text: `${quitter.name} breaks off — ${quitter.hunger > GATE.STARVING ? 'too hungry to keep talking' : 'needs to rest'}.`, thought: null, mood: null });
+      quitter._leftConversation = null;
+    }
+    // present = still in the convo AND not hopelessly failing (3+ misses)
+    const present = participants.filter(p => p.conversationId === convoId && p.alive !== false && failCount.get(p.name) < 3);
+    if (present.length < 2) break;
+
     let speakerIdx = pickNextSpeaker(participants, lastSpeakerIdx, speakCount, conversation.lines);
-    const speaker = participants[speakerIdx];
+    let speaker = participants[speakerIdx];
+    // pick someone present and reliable if the chosen speaker isn't usable
+    if (!present.includes(speaker)) {
+      speaker = present.find(p => p !== participants[lastSpeakerIdx]) || present[0];
+      speakerIdx = participants.indexOf(speaker);
+    }
     const others = participants.filter(p => p.name !== speaker.name);
     const cs = gameRef.current;
     const context = `${participants.length} people at ${conversation.location}. ${cs.timeOfDay}, day ${cs.day}. ${cs.weather}. ${
@@ -1896,10 +2149,30 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
 
     if (signal?.aborted) break;
     const result = await generateGroupDialogue(speaker, others, cs.people, context, history, signal);
-    if (!result) { await new Promise(r => setTimeout(r, 800)); continue; }
+    let dialogue = typeof result?.dialogue === 'string' ? result.dialogue.trim() : '';
+    // reject garbage: empty, or not predominantly latin/English (some pool models
+    // drift into other scripts). Count it as a failure for this speaker.
+    if (!result || !dialogue || !isUsableDialogue(dialogue)) {
+      failCount.set(speaker.name, failCount.get(speaker.name) + 1);
+      await new Promise(r => setTimeout(r, 500));
+      continue;
+    }
+
+    // cheap models love to parrot — drop a line that nearly duplicates one this
+    // conversation already had. Retry (doesn't count toward produced lines).
+    const norm = (s) => s.toLowerCase().replace(/[^a-z0-9 ]/g, '').slice(0, 60);
+    const nd = norm(dialogue);
+    if (conversation.lines.some(l => l.text && norm(l.text) === nd)) {
+      if (history.length) history.pop(); // don't let the dupe poison future prompts
+      failCount.set(speaker.name, failCount.get(speaker.name) + 1);
+      await new Promise(r => setTimeout(r, 400));
+      continue;
+    }
+    produced++;
+    failCount.set(speaker.name, 0); // success resets their tally
 
     conversation.lines.push({
-      speaker: speaker.name, text: result.dialogue, thought: result.internal_thought,
+      speaker: speaker.name, text: dialogue, thought: result.internal_thought,
       mood: result.mood_after, addressedTo: result.addressed_to || 'everyone',
     });
     speaker.mood = result.mood_after || speaker.mood;
@@ -1933,7 +2206,8 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
     gameRef.current = { ...gameRef.current, activeConversations: convos };
     onUpdate();
 
-    if (!result.wants_to_continue && t >= participants.length * 2) {
+    // let people leave once there's been a real exchange (not after line 1)
+    if (!result.wants_to_continue && produced >= participants.length * 2) {
       if (participants.length > 2) {
         speaker.conversationId = null;
         speaker.conversationCooldown = 10 + Math.floor(Math.random() * 10);
@@ -1942,6 +2216,7 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
         conversation.lines.push({ speaker: 'narrator', text: `${speaker.name} walks away.`, thought: null, mood: null });
         participants.splice(speakerIdx, 1);
         speakCount.delete(speaker.name);
+        failCount.delete(speaker.name);
         conversation.participants = participants.map(p => p.name);
         if (participants.length < 2) break;
         const convos2 = gameRef.current.activeConversations.map(c =>
@@ -2050,7 +2325,7 @@ export async function runAIAction(gameRef, personIdx, signal) {
     timeOfDay: cs.timeOfDay, weather: cs.weather, day: cs.day,
     hour: cs.hour, minute: cs.minute,
     season: cs.season, villageFood: totalFood(cs), larder: cs.larder,
-    wildlife: cs.wildlife, buildings: cs.buildings,
+    wildlife: cs.wildlife, buildings: cs.buildings, field: cs.field,
     learned: qBestActions(person, cs, 3),       // System 5: what's been paying off
     specialty: topSkill(person),                 // specialization identity
   }, signal);
@@ -2131,6 +2406,15 @@ export async function runAIAction(gameRef, personIdx, signal) {
       setGoal(person, 'gather_thatch', 'Meadow', 100);
       break;
 
+    case 'farm':
+    case 'tend_field':
+    case 'harvest':
+    case 'plant_crops':
+      goToLocation(person, 'Field');
+      person.activity = 'farming';
+      setGoal(person, 'farm', 'Field', 100);
+      break;
+
     case 'build':
       if (!person.buildProject) {
         // anyone can decide to build — not just partnered
@@ -2144,44 +2428,26 @@ export async function runAIAction(gameRef, personIdx, signal) {
       break;
 
     case 'hunt': {
-      // find nearest alive animal of the target type (or any)
-      const prey = cs.wildlife.find(w =>
-        w.alive && (!target || w.type.toLowerCase().includes(target.toLowerCase()))
-      );
+      // Begin the hunt — processHunting drives the per-tick chase from here,
+      // re-acquiring prey via vision and pursuing its live position. We just
+      // point them at the nearest visible (or named) animal to get started.
+      const tooHard = (person.skills?.hunting || 0) < 8;
+      let prey = nearestVisiblePrey(person, cs, { allowDangerous: !tooHard });
+      if (target) {
+        const named = cs.wildlife.find(w => w.alive && w.type.toLowerCase().includes(target.toLowerCase()));
+        if (named) prey = named;
+      }
       if (prey) {
-        person.targetX = prey.x;
-        person.targetY = prey.y;
         person.activity = 'hunting';
-        setGoal(person, 'hunt', prey.type, 80);
-        // attempt to catch if close enough — more reliable now so hunting is a
-        // viable strategy the Q-system can learn to value
-        if (distBetween(person, prey) < 2.5) {
-          const huntSkill = person.skills?.hunting || 0;
-          const seasonHunt = (SEASON_ABUNDANCE[cs.season] || { hunt: 1 }).hunt;
-          const catchChance = (0.35 + huntSkill * 0.005) * seasonHunt;
-          if (Math.random() < catchChance) {
-            prey.alive = false;
-            const meat = Math.max(2, Math.round(prey.foodValue));
-            addFood(person, 'meat', meat);
-            person.foodGathered += meat;
-            gainSkill(person, 'hunting', 1);
-            rewardAction(person, 'hunt', meat, cs);
-            setEmote(person, 'sparkle', 20);
-            addMemory(person, `Caught a ${prey.type}! Got ${meat} meat.`, 'achievement', cs.day, { location: person.currentLocation });
-            cs.events.push({ day: cs.day, hour: cs.hour, participants: [person.name], summary: `🏹 ${person.name} caught a ${prey.type}!`, type: 'hunt' });
-          } else if (prey.dangerous && Math.random() < 0.3) {
-            // dangerous prey can hurt you — hunting has real risk (Q learns this)
-            person.hunger = Math.min(100, person.hunger + 10);
-            setEmote(person, 'fear', 20);
-            rewardAction(person, 'hunt', -3, cs);
-            addMemory(person, `A ${prey.type} fought back while hunting!`, 'danger', cs.day, { location: person.currentLocation });
-          }
-        }
+        person._huntTargetId = prey.id; person._huntScan = 0;
+        person.targetX = prey.x; person.targetY = prey.y;
+        person.thought = `On the hunt for a ${prey.type}.`;
       } else {
-        person.thought = 'No animals around to hunt...';
+        // nothing in sight — go to open ground and scan (processHunting will too)
+        person.thought = 'No game in sight — heading out to look.';
         goToLocation(person, 'Grove');
-        person.activity = 'exploring';
-        setGoal(person, 'explore', null, 40);
+        person.activity = 'hunting';
+        person._huntTargetId = null; person._huntScan = 0;
       }
       break;
     }

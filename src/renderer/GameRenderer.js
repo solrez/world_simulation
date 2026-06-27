@@ -53,6 +53,7 @@ export class GameRenderer {
     this.particleLayer = new Container();
     this.bubbleLayer = new Container();
     this.lightLayer = new Container();
+    this.sightLayer = new Container();
     this.overlayLayer = new Container();
     this.weatherLayer = new Container();
     this.uiLayer = new Container();
@@ -99,7 +100,7 @@ export class GameRenderer {
 
     this.world = new Container();
     this.world.addChild(this.terrainLayer, this.shadowLayer, this.decorLayer, this.locationLayer,
-      this.characterLayer, this.particleLayer, this.bubbleLayer, this.lightLayer, this.overlayLayer, this.weatherLayer);
+      this.sightLayer, this.characterLayer, this.particleLayer, this.bubbleLayer, this.lightLayer, this.overlayLayer, this.weatherLayer);
     this.app.stage.addChild(this.world, this.uiLayer);
     this._setupInput(container);
     this.viewport.x = -(MW * this.viewport.zoom) / 2 + this.app.screen.width / 2;
@@ -386,6 +387,11 @@ export class GameRenderer {
       g.moveTo(fx, fy + size).lineTo(fx + (i % 2 ? -1 : 1) * 0.5, fy + size + 4)
         .stroke({ color: 0x3a7a3a, width: 0.6 });
     }
+
+    // field — tilled plot border (the crops themselves are drawn dynamically)
+    const fd = LOCATIONS.FIELD;
+    const fdx = fd.x * T + T / 2, fdy = fd.y * T + T / 2;
+    g.roundRect(fdx - 2.2 * T, fdy - 1.2 * T, 4.4 * T, 2.4 * T, 3).stroke({ color: 0x5a4a32, width: 2 });
 
     this.locationLayer.addChild(g);
 
@@ -914,13 +920,15 @@ export class GameRenderer {
       const lastLine = convo.lines[convo.lines.length - 1];
       const speaker = people.find(p => p.name === lastLine.speaker);
       if (!speaker || speaker.alive === false) continue;
+      if (!lastLine.text) continue; // skip empty/malformed lines (don't crash the canvas)
       this._drawBubble(speaker, lastLine.text);
     }
   }
 
   _drawBubble(speaker, text) {
+    if (!text) return;
     const px = speaker.x * T + T / 2, py = speaker.y * T - 25;
-    const words = text.split(' ');
+    const words = String(text).split(' ');
     const lines = []; let cur = '';
     for (const w of words) {
       if ((cur + ' ' + w).length > 28 && cur) { lines.push(cur); cur = w; } else { cur = cur ? cur + ' ' + w : w; }
@@ -1074,6 +1082,40 @@ export class GameRenderer {
     this.locationLayer.addChild(g);
   }
 
+  // ── FIELD / CROPS ──
+  // Redraws the crop rows to reflect growth: bare furrows when fallow, short
+  // green shoots while growing, tall golden stalks when ripe (and ready to reap).
+  updateField(field) {
+    if (this._fieldGfx) this.locationLayer.removeChild(this._fieldGfx);
+    const g = new Graphics();
+    const fd = LOCATIONS.FIELD;
+    const cx = fd.x * T + T / 2, cy = fd.y * T + T / 2;
+    const stage = field?.planted ? Math.min(1, field.stage || 0) : 0;
+    const ripe = stage >= 1;
+    const sway = Math.sin(this._animFrame * 0.08) * (1 + stage);
+
+    const cols = 9, rows = 4;
+    const spanX = 4 * T, spanY = 2 * T;
+    for (let r = 0; r < rows; r++) {
+      const py = cy - spanY / 2 + (r + 0.5) * (spanY / rows);
+      // furrow line
+      g.moveTo(cx - spanX / 2, py).lineTo(cx + spanX / 2, py).stroke({ color: 0x4a3a26, width: 1, alpha: 0.6 });
+      if (!field?.planted) continue;
+      for (let c = 0; c < cols; c++) {
+        const px = cx - spanX / 2 + (c + 0.5) * (spanX / cols);
+        const h = 2 + stage * 9;                  // stalk height grows with stage
+        const jitter = Math.sin((r * 7 + c * 3)) * 0.6;
+        const tipx = px + sway * (0.3 + stage) + jitter;
+        const col = ripe ? 0xd8b24a : (stage > 0.5 ? 0x6fae3a : 0x4e8a30);
+        g.moveTo(px, py).lineTo(tipx, py - h).stroke({ color: col, width: 1.2 });
+        if (ripe) g.circle(tipx, py - h, 1.3).fill(0xe8c860); // grain heads
+      }
+    }
+
+    this._fieldGfx = g;
+    this.locationLayer.addChild(g);
+  }
+
   // ── DAY/NIGHT ──
 
   updateDayNight(timeOfDay, hourFloat) {
@@ -1143,6 +1185,31 @@ export class GameRenderer {
     this._trailGfx = g;
     this.terrainLayer.addChild(g);
   }
+
+  // ── SIGHT / VISION OVERLAY ──
+  // Visualize what one focused person (selected or followed) can perceive: a
+  // soft sight circle, plus a marker on each animal currently in their view and
+  // a line to whatever they're hunting. Makes the "virtual eyes" tangible.
+  drawSight(person, radius, visibleAnimals) {
+    this.sightLayer.removeChildren();
+    if (!person) return;
+    const g = new Graphics();
+    const px = person.x * T + T / 2, py = person.y * T + T / 2;
+    // sight area
+    g.circle(px, py, radius * T).fill({ color: 0x88ccff, alpha: 0.05 });
+    g.circle(px, py, radius * T).stroke({ color: 0x88ccff, width: 1, alpha: 0.18 });
+    // mark animals in view + line to the hunt target
+    for (const a of visibleAnimals || []) {
+      const ax = a.x * T + T / 2, ay = a.y * T + T / 2;
+      g.circle(ax, ay, 9).stroke({ color: 0xffdd55, width: 1.2, alpha: 0.7 });
+      if (person.activity === 'hunting' && person._huntTargetId === a.id) {
+        g.moveTo(px, py).lineTo(ax, ay).stroke({ color: 0xff5544, width: 1.2, alpha: 0.6 });
+      }
+    }
+    this.sightLayer.addChild(g);
+  }
+
+  clearSight() { this.sightLayer.removeChildren(); }
 
   // ── CAMERA ──
 

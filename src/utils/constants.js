@@ -19,6 +19,23 @@ export const LOCATIONS = {
   ROCK_SEAT: { x: 18, y: 4, name: 'Rock Seat', type: 'stone' },
   BERRY_BUSH: { x: 4, y: 12, name: 'Berry Bush', type: 'food' },
   FISHING_SPOT: { x: 22, y: 14, name: 'Fishing Spot', type: 'food' },
+  FIELD: { x: 12, y: 18, name: 'Field', type: 'farm' },
+};
+
+// ── Farming ──
+// A multi-day crop cycle: someone sows the fallow field, it grows over several
+// game-days (only in the growing seasons — frozen in winter), it must be tended,
+// and once ripe it's harvested for `crops`. Q-learning lets agents discover that
+// farming pays off big but slowly, and is pointless to sow in winter.
+export const FARM = {
+  GROW_DAYS: 4,          // game-days from sprout to ripe (with tending)
+  RIPE: 1.0,             // stage at which it can be harvested
+  TEND_GAIN: 0.04,       // growth added per successful tend tick (speeds ripening)
+  PASSIVE_GROW_PER_DAY: 1 / 4, // baseline growth/day even untended (= 1/GROW_DAYS)
+  BASE_YIELD: 6,         // crops from a harvest at skill 0
+  SKILL_YIELD: 0.12,     // extra crops per point of farming skill
+  // seasons in which sown crops actually grow (winter freezes progress)
+  GROW_SEASONS: ['spring', 'summer', 'fall'],
 };
 
 export const BUILD_REQUIREMENTS = {
@@ -94,6 +111,25 @@ export const PERSONALITIES = [
     background: 'Used to travel alone. Tells people he chose the wandering life but truth is he was running from grief — lost someone close and never dealt with it. Uses humor to keep people at arm\'s length. Notices everything about people but pretends he doesn\'t. Wants to be known but is terrified of it.',
     speechStyle: 'Chatty, uses humor to deflect. Makes references to things he\'s seen traveling. Says "honestly" before being dishonest. Gets surprisingly real late at night or when caught off guard. Trails off mid-thought when something hits close to home.',
   },
+];
+
+// ── Per-agent model pool (OpenRouter) ──
+// Each agent is assigned one of these at birth, so different people literally
+// "think" with different models — distinct voices, not just distinct prompts.
+// All are cheap, instruction-tuned, and reliably emit JSON. Routed through
+// OpenRouter (one key, one endpoint). Swap freely; unknown models just fall
+// back to null (reflex behavior) without breaking anything.
+export const MODEL_POOL = [
+  'meta-llama/llama-3.3-70b-instruct',
+  'meta-llama/llama-3.1-8b-instruct',
+  'mistralai/mistral-nemo',
+  'mistralai/mistral-7b-instruct',
+  'qwen/qwen-2.5-72b-instruct',
+  'qwen/qwen-2.5-7b-instruct',
+  'google/gemma-2-27b-it',
+  'google/gemma-2-9b-it',
+  'deepseek/deepseek-chat',
+  'nousresearch/hermes-3-llama-3.1-70b',
 ];
 
 export const MOODS = ['happy', 'neutral', 'sad', 'excited', 'thoughtful', 'anxious', 'flirty', 'annoyed', 'lonely', 'content', 'jealous', 'heartbroken', 'loving'];
@@ -179,7 +215,7 @@ export const CHILD_NAMES = {
   female: ['Ivy', 'Luna', 'Fern', 'Hazel', 'Lily', 'Willa', 'Delia', 'Maeve', 'Nora', 'Thea'],
 };
 
-export const SKILLS = ['fishing', 'building', 'foraging', 'storytelling', 'healing', 'hunting', 'crafting'];
+export const SKILLS = ['fishing', 'building', 'foraging', 'storytelling', 'healing', 'hunting', 'crafting', 'farming'];
 
 // ── Food economy (typed food + larder + spoilage) ──
 // Each food type has a hunger-restore value and a spoilage rate (fraction lost

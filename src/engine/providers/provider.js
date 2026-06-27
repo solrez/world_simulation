@@ -8,11 +8,12 @@
 // so a provider that always returns null degrades the sim gracefully to its
 // local reflex + schedule behavior.
 //
-// The active provider is selected by VITE_AI_PROVIDER ('openai' | 'local').
-// Claude is intentionally not wired yet — the interface is here so it can drop
-// in later behind the same contract without touching ai.js.
+// The active provider is selected by VITE_AI_PROVIDER ('openrouter' | 'openai'
+// | 'local'). Per-agent models (passed as `model` on each complete() call) are
+// supported by the OpenRouter provider; others ignore it and use their default.
 
 import { OpenAIProvider } from './openaiProvider.js';
+import { OpenRouterProvider } from './openrouterProvider.js';
 import { LocalProvider } from './localProvider.js';
 
 let _provider = null;
@@ -25,12 +26,14 @@ export function getProvider() {
 
 // Exposed mainly for tests / runtime reconfiguration.
 export function createProvider(config = {}) {
-  const name = config.provider || import.meta.env.VITE_AI_PROVIDER || 'openai';
+  const name = config.provider || import.meta.env.VITE_AI_PROVIDER || 'openrouter';
   switch (name) {
     case 'local':
       return new LocalProvider(config);
     case 'openai':
-    default:
       return new OpenAIProvider(config);
+    case 'openrouter':
+    default:
+      return new OpenRouterProvider(config);
   }
 }

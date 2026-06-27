@@ -50,6 +50,11 @@ export function SidePanel({ people, selectedPerson, onSelect, onFollow, followin
               {sel.partner && <span className="partner-tag"> · ❤ {sel.partner}</span>}
               {sel.pregnant && <span className="pregnant-tag"> · expecting</span>}
             </div>
+            {sel.model && (
+              <div className="villager-model" title="The LLM this villager thinks with" style={{ fontSize: 9, opacity: 0.55, marginTop: 2 }}>
+                🧠 {sel.model.split('/').pop()}
+              </div>
+            )}
 
             <Stat label="Mood" value={sel.mood} emoji={moodEmoji(sel.mood)} />
             <Stat label="Activity" value={sel.sleeping ? '💤 sleeping' : sel.eating ? '🍎 eating' : sel.sick ? '🤒 sick' : sel.activity} />

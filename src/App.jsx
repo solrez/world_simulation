@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { GameRenderer } from './renderer/GameRenderer.js';
 import { createSimulation, simulateTick, findConversationGroup, runConversation, runAIAction, downloadConversationArchive, downloadFullWorldState } from './engine/simulation.js';
+import { perceive } from './engine/vision.js';
 import { SidePanel } from './components/SidePanel.jsx';
 import { ConversationLog } from './components/ConversationLog.jsx';
 import { GodPowers, applyGodPower } from './components/GodPowers.jsx';
@@ -25,6 +26,9 @@ function App() {
   const rendererRef = useRef(null);
   const pixiRef = useRef(null);
   const activeConvoCount = useRef(0);
+  const selectedRef = useRef(null);
+
+  useEffect(() => { selectedRef.current = selectedPerson; }, [selectedPerson]);
 
   useEffect(() => {
     gameRef.current = { ...gameRef.current, speed };
@@ -83,6 +87,7 @@ function App() {
         rendererRef.current.updateWildlife(next.wildlife);
         rendererRef.current.updateBubbles(next.activeConversations, next.people);
         rendererRef.current.updateCampfire();
+        rendererRef.current.updateField(next.field);
         rendererRef.current.updateDayNight(next.timeOfDay, next.hour + next.minute / 60);
         rendererRef.current.updateWeather(next.weather);
         rendererRef.current.updateTrails(next.people);
@@ -92,6 +97,16 @@ function App() {
         if (following !== null) {
           const person = next.people[following];
           if (person && person.alive !== false) rendererRef.current.followPerson(person);
+        }
+
+        // vision overlay for the focused person (followed, else selected)
+        const focusIdx = following !== null ? following : selectedRef.current;
+        const focus = focusIdx !== null && focusIdx !== undefined ? next.people[focusIdx] : null;
+        if (focus && focus.alive !== false) {
+          const view = perceive(focus, next);
+          rendererRef.current.drawSight(focus, view.radius, view.animals);
+        } else {
+          rendererRef.current.clearSight();
         }
       }
     }, 400 / speed);
@@ -203,6 +218,10 @@ function App() {
           <span className="header-stat">{game.season}</span>
           <span className="sep">·</span>
           <span className={`header-stat ${larderTotal(game.larder) < 10 ? 'food-critical' : ''}`}>🍖 {larderTotal(game.larder)}</span>
+          <span className="sep">·</span>
+          <span className="header-stat dim" title="Field crop status">
+            🌾 {!game.field?.planted ? 'fallow' : game.field.stage >= 1 ? 'ripe!' : `${Math.round(game.field.stage * 100)}%`}
+          </span>
         </div>
         <div className="header-right">
           <button className="hdr-btn export-btn" onClick={() => downloadConversationArchive()} title="Download all conversations as JSON">

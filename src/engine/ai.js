@@ -1,10 +1,11 @@
 import { getProvider } from './providers/provider.js';
 
-// All model calls go through the active provider (OpenAI by default, swappable
-// to local/Claude via VITE_AI_PROVIDER). callLLM keeps the old callOpenAI
-// signature so the three call sites below stay unchanged.
-function callLLM(systemPrompt, userPrompt, temperature = 0.9, maxTokens = 500, label, signal) {
-  return getProvider().complete({ system: systemPrompt, user: userPrompt, temperature, maxTokens, label, signal });
+// All model calls go through the active provider (OpenRouter by default,
+// swappable via VITE_AI_PROVIDER). `model` lets a specific agent think with
+// their own assigned model; providers that don't support per-call models ignore
+// it and use their default.
+function callLLM(systemPrompt, userPrompt, temperature = 0.9, maxTokens = 500, label, signal, model) {
+  return getProvider().complete({ system: systemPrompt, user: userPrompt, temperature, maxTokens, label, signal, model });
 }
 
 // ── helpers ──
@@ -136,10 +137,17 @@ You can also UPDATE YOUR GOALS if they no longer make sense. Drop goals that fee
   const larder = worldState.larder || {};
   const larderStr = Object.entries(larder).filter(([, v]) => v > 0).map(([k, v]) => `${v} ${k}`).join(', ') || 'bare';
 
+  const f = worldState.field;
+  const fieldStr = !f ? '' : !f.planted
+    ? 'The field is fallow — nobody has sown it. Crops keep best through winter.'
+    : f.stage >= 1
+      ? 'The field is RIPE — ready to harvest for crops!'
+      : `The field is sown and ${Math.round(f.stage * 100)}% grown — it could use tending.`;
+
   const userPrompt = `CURRENT SITUATION:
 Location: ${person.currentLocation || 'settlement'}.
 Time: ${worldState.timeOfDay} (${worldState.hour}:${String(worldState.minute).padStart(2,'0')}), Day ${worldState.day}, ${worldState.season}. Weather: ${worldState.weather}.
-Village larder: ${larderStr}.${learnedStr ? `\nWHAT YOU'VE LEARNED works ${worldState.season}: ${learnedStr}.` : ''}
+Village larder: ${larderStr}.${fieldStr ? `\nThe Field: ${fieldStr}` : ''}${learnedStr ? `\nWHAT YOU'VE LEARNED works ${worldState.season}: ${learnedStr}.` : ''}
 
 PEOPLE:
 ${world.others || 'Nobody around.'}
@@ -156,6 +164,7 @@ PLACES YOU CAN GO:
 - Meadow: gather thatch/grass, relax
 - Berry Bush: forage for berries and herbs
 - Fishing Spot: catch fish
+- Field: sow, tend, and harvest crops (slow but a big, long-keeping payoff)
 - Campfire: socialize, cook, warm up
 - Well: get water
 - Pond: fish, reflect, be alone
@@ -168,7 +177,7 @@ What do you do? Think step by step as ${person.name}, then decide.
 
 JSON response:
 {
-  "action": "go_to/seek_person/rest/chop_wood/collect_stone/gather_thatch/gather_food/fish/build/hunt/explore/sit_and_think/heal_person/craft",
+  "action": "go_to/seek_person/rest/chop_wood/collect_stone/gather_thatch/gather_food/fish/farm/build/hunt/explore/sit_and_think/heal_person/craft",
   "target": "location name or person name or animal type",
   "reason": "why — one sentence, in first person as ${person.name}",
   "mood": "your mood now",
@@ -176,7 +185,7 @@ JSON response:
   "update_goals": [{"action": "add/drop", "goal": "description"}] or null
 }`;
 
-  return callLLM(systemPrompt, userPrompt, 0.9, 400, 'action', signal);
+  return callLLM(systemPrompt, userPrompt, 0.9, 400, 'action', signal, person.model);
 }
 
 // ── DIALOGUE ──
@@ -213,7 +222,15 @@ Talk about REAL things:
 - Reference past conversations you've had with them
 - Gossip, complaints, plans, observations
 - Sometimes be awkward, trail off, change the subject
-- DON'T always be poetic or philosophical. Be mundane sometimes.`;
+- DON'T always be poetic or philosophical. Be mundane sometimes.
+
+STAY GROUNDED — this is a small primitive settlement. Only mention things that
+actually exist here: the people listed, the places (Campfire, Grove, Meadow,
+Berry Bush, Fishing Spot, Pond, Well, Rock Seat, Field), real food (berries,
+fish, meat, crops), wood/stone/thatch, the weather and season. DO NOT invent
+feasts, festivals, gods, religions, towns, shops, mythical creatures, or past
+events that aren't in your memories. If you feel a "divine presence," it's only
+because something genuinely strange just happened — don't manufacture it.`;
 
   const userPrompt = `TALKING WITH:
 ${othersDesc}
@@ -223,11 +240,13 @@ WHERE: ${context}
 PAST CONVERSATIONS WITH THESE PEOPLE:
 ${pastConvos}
 
-${history.length > 0 ? `THIS CONVERSATION:\n${history.slice(-10).map(h => `${h.speaker}: ${h.text}`).join('\n')}` : 'You just ran into each other. Say something natural — greeting, comment, question.'}
+${history.length > 0
+  ? `THIS CONVERSATION SO FAR:\n${history.slice(-10).map(h => `${h.speaker}: ${h.text}`).join('\n')}\n\n${history[history.length - 1].speaker} just said: "${history[history.length - 1].text}"\nRESPOND DIRECTLY to that — answer their question, react to what they said, or build on it. Do NOT start a fresh greeting or repeat an earlier line. This is a back-and-forth, not a monologue.`
+  : 'You just ran into each other. Say something natural — a greeting, a comment, or a question to get them talking.'}
 
 ${formatMemories(speaker, 3) ? `YOUR RECENT MEMORIES:\n${formatMemories(speaker, 3)}` : ''}
 
-Say something as ${speaker.name}. 1-3 sentences, natural.
+Say something as ${speaker.name}. 1-3 sentences, natural. ${history.length > 0 ? `You are REPLYING to ${history[history.length - 1].speaker} — actually engage with what they said.` : ''}
 
 JSON:
 {
@@ -241,8 +260,10 @@ JSON:
   "wants_to_continue": true or false
 }`;
 
-  const result = await callLLM(systemPrompt, userPrompt, 0.95, 400, 'dialogue', signal);
-  if (!result) return null;
+  // each speaker thinks with their own assigned model — distinct voices per line
+  const result = await callLLM(systemPrompt, userPrompt, 0.95, 400, 'dialogue', signal, speaker.model);
+  // some cheap models return JSON missing `dialogue` (or empty) — treat as a miss
+  if (!result || typeof result.dialogue !== 'string' || !result.dialogue.trim()) return null;
   history.push({ speaker: speaker.name, text: result.dialogue, thought: result.internal_thought });
   if (history.length > 30) history.splice(0, history.length - 30);
   return result;
@@ -277,5 +298,5 @@ JSON:
   "estimated_quality": "crude/basic/decent/good/excellent"
 }`;
 
-  return callLLM(systemPrompt, userPrompt, 0.85, 300, 'build');
+  return callLLM(systemPrompt, userPrompt, 0.85, 300, 'build', undefined, person.model);
 }
