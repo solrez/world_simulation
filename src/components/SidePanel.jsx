@@ -14,18 +14,24 @@ function learnedRows(p) {
     .slice(0, 6);
 }
 
-export function SidePanel({ people, selectedPerson, onSelect, onFollow, following }) {
+export function SidePanel({ people, selectedPerson, onSelect, onFollow, following, activePower }) {
   const sel = selectedPerson !== null ? people[selectedPerson] : null;
+  // when resurrecting, the dead become clickable targets (and are highlighted)
+  const resurrecting = activePower === 'resurrect';
 
   return (
     <div className="side-panel">
       <div className="panel-section">
         <div className="section-label">Villagers ({people.length})</div>
+        {resurrecting && <div className="resurrect-hint">🌟 Click a fallen villager (✝) to raise them</div>}
         {people.map((p, i) => (
           <div
             key={p.name}
-            className={`villager-row ${selectedPerson === i ? 'selected' : ''} ${p.alive === false ? 'dead' : ''}`}
-            onClick={() => p.alive !== false && onSelect(selectedPerson === i ? null : i)}
+            className={`villager-row ${selectedPerson === i ? 'selected' : ''} ${p.alive === false ? 'dead' : ''} ${resurrecting && p.alive === false ? 'revivable' : ''}`}
+            onClick={() => {
+              if (p.alive === false) { if (resurrecting) onSelect(i); return; }
+              onSelect(selectedPerson === i ? null : i);
+            }}
           >
             <div className="villager-dot" style={{ background: `#${p.color.toString(16).padStart(6, '0')}` }} />
             <span className="villager-name">
@@ -69,6 +75,18 @@ export function SidePanel({ people, selectedPerson, onSelect, onFollow, followin
             {topSkillOf(sel) && <Stat label="Known for" value={`⭐ ${topSkillOf(sel)}`} />}
             {sel.buildProject && sel.buildProject.phase !== 'complete' && (
               <div className="build-tag">🏗 Building: {sel.buildProject.type} ({sel.buildProject.phase})</div>
+            )}
+            {sel.techRole && <Stat label="Role" value={`🛠 ${sel.techRole}`} />}
+            {sel.prototype && (
+              <div className="build-tag" style={{ background: 'rgba(180,140,40,0.18)' }}>
+                💡 Experimenting: {sel.prototype.label} — {Math.round((sel.prototype.progress || 0) * 100)}% (attempt, {sel.prototype.attemptsLeft} to go)
+              </div>
+            )}
+            {sel.knownTech && Object.keys(sel.knownTech).length > 0 && (
+              <Stat label="Knows how to make" value={Object.keys(sel.knownTech).length + ' invention(s)'} />
+            )}
+            {sel.noticedResources && Object.keys(sel.noticedResources).length > 0 && (
+              <Stat label="Noticed" value={Object.keys(sel.noticedResources).join(', ')} />
             )}
             {sel.awe > 0 && <Stat label="Awe" value={`🌌 ${Math.round(sel.awe)}`} />}
             {sel.sick && <div className="sick-tag">🤒 Ill — recovering</div>}

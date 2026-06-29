@@ -46,6 +46,7 @@ export class GameRenderer {
     this.shadowLayer = new Container();
     this.decorLayer = new Container();
     this.locationLayer = new Container();
+    this.resourceLayer = new Container(); // discovered hidden resource nodes (Phase 6)
     this.characterLayer = new Container();
     // villagers AND vertical decor (trees/bushes/rocks) share this layer and
     // sort by zIndex (feet-baseline Y) so they interleave in a 2.5D way.
@@ -93,43 +94,99 @@ export class GameRenderer {
       });
       this._fontReady = true;
     }
-    new ResizeObserver(() => {
+    this._resizeObserver = new ResizeObserver(() => {
       const nw = container.clientWidth, nh = container.clientHeight;
       if (nw > 0 && nh > 0) this.app.renderer.resize(nw, nh);
-    }).observe(container);
+    });
+    this._resizeObserver.observe(container);
 
     this.world = new Container();
     this.world.addChild(this.terrainLayer, this.shadowLayer, this.decorLayer, this.locationLayer,
-      this.sightLayer, this.characterLayer, this.particleLayer, this.bubbleLayer, this.lightLayer, this.overlayLayer, this.weatherLayer);
+      this.resourceLayer, this.sightLayer, this.characterLayer, this.particleLayer, this.bubbleLayer, this.lightLayer, this.overlayLayer, this.weatherLayer);
     this.app.stage.addChild(this.world, this.uiLayer);
     this._setupInput(container);
+    // fit the (now larger) map to the viewport on load, with a little margin, so
+    // the whole village is visible at start instead of a tight crop.
+    const fit = Math.min(this.app.screen.width / MW, this.app.screen.height / MH) * 0.92;
+    this.viewport.zoom = Math.max(0.3, Math.min(2.2, fit));
     this.viewport.x = -(MW * this.viewport.zoom) / 2 + this.app.screen.width / 2;
     this.viewport.y = -(MH * this.viewport.zoom) / 2 + this.app.screen.height / 2;
     this.app.ticker.add(() => this._tick());
   }
 
   _setupInput(el) {
-    el.addEventListener('wheel', (e) => {
+    // keep handlers + their targets so destroy() can unbind them (the window-bound
+    // ones in particular would otherwise leak the renderer after unmount/HMR).
+    this._inputEl = el;
+    this._listeners = [];
+    const on = (target, type, handler, opts) => {
+      target.addEventListener(type, handler, opts);
+      this._listeners.push({ target, type, handler, opts });
+    };
+    on(el, 'wheel', (e) => {
       e.preventDefault();
-      const oz = this.viewport.zoom;
-      this.viewport.zoom = Math.max(0.6, Math.min(5, oz * (e.deltaY < 0 ? 1.12 : 0.88)));
+      // Coalesce bursts of wheel events (trackpads fire many per gesture) into one
+      // zoom update per animation frame, anchored at the latest cursor position.
       const r = el.getBoundingClientRect();
-      const mx = e.clientX - r.left, my = e.clientY - r.top;
-      this.viewport.x = mx - (mx - this.viewport.x) * (this.viewport.zoom / oz);
-      this.viewport.y = my - (my - this.viewport.y) * (this.viewport.zoom / oz);
+      this._pendingZoom = (this._pendingZoom || 1) * (e.deltaY < 0 ? 1.12 : 0.88);
+      this._zoomAnchor = { x: e.clientX - r.left, y: e.clientY - r.top };
+      if (this._zoomRaf) return;
+      this._zoomRaf = requestAnimationFrame(() => {
+        this._zoomRaf = null;
+        const oz = this.viewport.zoom;
+        // wider range than before: zoom further out (0.3) to see the whole map and
+        // much closer in (8) to inspect the detailed character sprites.
+        this.viewport.zoom = Math.max(0.3, Math.min(8, oz * this._pendingZoom));
+        this._pendingZoom = 1;
+        const { x: mx, y: my } = this._zoomAnchor;
+        this.viewport.x = mx - (mx - this.viewport.x) * (this.viewport.zoom / oz);
+        this.viewport.y = my - (my - this.viewport.y) * (this.viewport.zoom / oz);
+      });
     }, { passive: false });
-    el.addEventListener('pointerdown', (e) => {
+    on(el, 'pointerdown', (e) => {
       this._dragging = true;
+      this._moved = false;
       this._dragStart = { x: e.clientX, y: e.clientY };
       this._vpStart = { x: this.viewport.x, y: this.viewport.y };
       el.style.cursor = 'grabbing';
     });
-    window.addEventListener('pointermove', (e) => {
+    on(window, 'pointermove', (e) => {
       if (!this._dragging) return;
-      this.viewport.x = this._vpStart.x + (e.clientX - this._dragStart.x);
-      this.viewport.y = this._vpStart.y + (e.clientY - this._dragStart.y);
+      const dx = e.clientX - this._dragStart.x, dy = e.clientY - this._dragStart.y;
+      if (Math.abs(dx) + Math.abs(dy) > 4) this._moved = true; // it's a drag, not a click
+      this.viewport.x = this._vpStart.x + dx;
+      this.viewport.y = this._vpStart.y + dy;
     });
-    window.addEventListener('pointerup', () => { this._dragging = false; });
+    on(window, 'pointerup', () => { this._dragging = false; el.style.cursor = 'grab'; });
+    // a click (down+up without dragging) selects a villager if one is under the
+    // cursor, otherwise inspects the tile. Converts screen → world tile space.
+    on(el, 'click', (e) => {
+      if (this._moved) return;
+      const r = el.getBoundingClientRect();
+      const sx = e.clientX - r.left, sy = e.clientY - r.top;
+      const wx = (sx - this.viewport.x) / this.viewport.zoom / T;
+      const wy = (sy - this.viewport.y) / this.viewport.zoom / T;
+
+      // hit-test villagers first — sprites are drawn centred on (x,y) tile coords;
+      // their visible body is ~1 tile tall, with the head above the feet, so we
+      // accept a click within ~0.9 tiles horizontally and a bit taller vertically.
+      if (this.onVillagerClick && this._people) {
+        let best = null, bestD = 1.1;
+        for (const p of this._people) {
+          if (p.alive === false) continue;
+          const dx = wx - p.x;
+          const dy = wy - (p.y - 0.4); // bias up toward the body/head
+          const d = Math.hypot(dx, dy * 0.8);
+          if (d < bestD) { bestD = d; best = p; }
+        }
+        if (best) { this.onVillagerClick(best); return; }
+      }
+
+      const tx = Math.floor(wx), ty = Math.floor(wy);
+      if (tx >= 0 && ty >= 0 && tx < MAP_W && ty < MAP_H && this.onTileClick) {
+        this.onTileClick(tx, ty);
+      }
+    });
   }
 
   _tick() {
@@ -239,11 +296,16 @@ export class GameRenderer {
 
     // detailed trees around grove — kept in a list so the grove can visibly thin
     // as it's chopped (updateEnvironment fades/hides them by patch level).
+    // Positions derive from the Grove location so they track the map layout.
     this._groveTrees = [];
-    const treeClusters = [
-      [4,3],[5,4],[7,3],[8,5],[5,6],[7,6],[4,5],[8,4],[3,4],[9,5],[6,3],[6,7],
+    const grove = LOCATIONS.TREE_GROVE;
+    const groveOffsets = [
+      [-4,-3],[-3,-2],[-1,-3],[0,-1],[-3,0],[-1,0],[-4,-1],[0,-2],[-5,-2],[1,-1],[-2,-3],[-2,1],
+      [2,0],[1,1],[-4,1],[2,-2],[0,1],[-1,2],
     ];
-    for (const [tx, ty] of treeClusters) {
+    for (const [ox, oy] of groveOffsets) {
+      const tx = grove.x + ox, ty = grove.y + oy;
+      if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) continue;
       const px = tx * T + T / 2, py = ty * T + T / 2;
       const og = new Graphics();
       this._drawTree(og, px, py, 'large');
@@ -252,34 +314,49 @@ export class GameRenderer {
       this._groveTrees.push(og);
     }
 
-    // scattered trees with variety
-    const scattered = [[22,5],[26,10],[2,12],[10,19],[28,3],[1,8],[15,18],[25,19],[12,2],[27,7],[16,3],[3,18],[20,17],[11,7],[18,15]];
-    for (const [tx, ty] of scattered) {
-      if (tx >= MAP_W || ty >= MAP_H) continue;
+    // scattered trees with variety — a deterministic spread across the whole map,
+    // skipping water and the immediate area around each location.
+    const occupied = Object.values(LOCATIONS);
+    let placed = 0;
+    for (let s = 0; placed < 28 && s < 400; s++) {
+      const tx = (s * 7 + 3) % MAP_W;
+      const ty = (s * 11 + 5) % MAP_H;
+      if (terrain[ty]?.[tx]?.type === TERRAIN.WATER) continue;
+      if (occupied.some(l => Math.abs(l.x - tx) < 3 && Math.abs(l.y - ty) < 3)) continue;
+      if (Math.abs(tx - grove.x) < 6 && Math.abs(ty - grove.y) < 6) continue; // grove handled above
       const px = tx * T + T / 2, py = ty * T + T / 2;
-      occluder(px, py, og => this._drawTree(og, px, py, tx % 3 === 0 ? 'pine' : 'small'));
+      occluder(px, py, og => this._drawTree(og, px, py, s % 3 === 0 ? 'pine' : 'small'));
+      placed++;
     }
 
-    // rocks near rock seat — mossy boulders
-    occluder(17 * T + 10, 4 * T + 8, og => this._drawRock(og, 17 * T + 10, 4 * T + 8, 6));
-    occluder(18 * T + 14, 4 * T + 12, og => this._drawRock(og, 18 * T + 14, 4 * T + 12, 5));
-    occluder(19 * T + 4, 4 * T + 4, og => this._drawRock(og, 19 * T + 4, 4 * T + 4, 3.5));
+    // rocks near rock seat — mossy boulders (offset from the Rock Seat location)
+    const rs = LOCATIONS.ROCK_SEAT;
+    occluder(rs.x * T - 6, rs.y * T + 8, og => this._drawRock(og, rs.x * T - 6, rs.y * T + 8, 6));
+    occluder(rs.x * T + 14, rs.y * T + 12, og => this._drawRock(og, rs.x * T + 14, rs.y * T + 12, 5));
+    occluder(rs.x * T + 4, rs.y * T - 6, og => this._drawRock(og, rs.x * T + 4, rs.y * T - 6, 3.5));
 
-    // pond reeds and lilypads (flat — stay in decorLayer)
-    for (let i = 0; i < 8; i++) {
-      const rx = 23 * T + i * 4 + 2, ry = 14 * T + (i % 3) * 4;
+    // pond reeds and lilypads (flat — stay in decorLayer), around the Pond location
+    const pond = LOCATIONS.POND;
+    const pondX = pond.x * T, pondY = pond.y * T;
+    for (let i = 0; i < 10; i++) {
+      const rx = pondX - 18 + i * 5, ry = pondY - 14 + (i % 3) * 5;
       flat.moveTo(rx, ry + 10).quadraticCurveTo(rx + 1, ry + 3, rx - 0.5, ry).stroke({ color: 0x4a7a3a, width: 1.2 });
       flat.circle(rx, ry - 1, 2).fill(0x5a8a4a);
     }
-    const pondX = 24 * T, pondY = 15 * T;
-    for (let i = 0; i < 4; i++) {
-      const lx = pondX + (i * 7) - 5, ly = pondY + (i % 2) * 8 + 4;
+    for (let i = 0; i < 5; i++) {
+      const lx = pondX + (i * 8) - 12, ly = pondY + (i % 2) * 9 - 2;
       flat.circle(lx, ly, 3).fill({ color: 0x3a7a3a, alpha: 0.7 });
       flat.circle(lx + 0.5, ly - 0.5, 1).fill({ color: 0xff6688, alpha: 0.6 });
     }
 
-    // bushes scattered (vertical occluders)
-    const bushes = [[5,10],[10,14],[20,12],[25,6],[3,7],[14,17],[8,3]];
+    // bushes scattered (vertical occluders) — deterministic spread
+    const bushes = [];
+    for (let s = 0; bushes.length < 12 && s < 200; s++) {
+      const bx = (s * 13 + 6) % MAP_W, by = (s * 5 + 9) % MAP_H;
+      if (terrain[by]?.[bx]?.type === TERRAIN.WATER) continue;
+      if (occupied.some(l => Math.abs(l.x - bx) < 2 && Math.abs(l.y - by) < 2)) continue;
+      bushes.push([bx, by]);
+    }
     for (const [bx, by] of bushes) {
       const px = bx * T + T / 2, py = by * T + T / 2;
       occluder(px, py, og => {
@@ -294,7 +371,6 @@ export class GameRenderer {
     }
 
     this.decorLayer.addChild(flat);
-    void terrain;
   }
 
   _drawTree(g, px, py, type) {
@@ -619,6 +695,7 @@ export class GameRenderer {
   // ── CHARACTERS ──
 
   updateCharacters(people) {
+    this._people = people; // stash latest positions for click hit-testing
     const tick = this._animFrame;
 
     for (const person of people) {
@@ -823,6 +900,18 @@ export class GameRenderer {
     g.clear();
     const dead = person.alive === false;
     const isSleeping = person.sleeping;
+
+    // the god avatar gets a glowing aura so it's unmistakable on the map —
+    // a soft pulsing halo (gold when divine, pale silver as a mysterious stranger).
+    if (person.isAvatar) {
+      const col = person.divine ? 0xffe066 : 0xcfe8ff;
+      const pulse = 0.5 + 0.5 * Math.sin(tick * 0.08);
+      for (let r = 0; r < 3; r++) {
+        g.circle(0, -4 * s, (16 + r * 6) * s).fill({ color: col, alpha: (person.divine ? 0.10 : 0.06) * (1 - r * 0.25) * (0.6 + pulse * 0.4) });
+      }
+      // a small crown/spark above the head when divine
+      if (person.divine) g.star(0, -22 * s, 5, 4 * s, 2 * s).fill({ color: col, alpha: 0.7 + pulse * 0.3 });
+    }
 
     // pulse indicators
     if (!dead) {
@@ -1202,6 +1291,40 @@ export class GameRenderer {
     this.locationLayer.addChild(g);
   }
 
+  // ── DISCOVERED RESOURCE NODES (Phase 6) ──
+  // Hidden until noticed: only nodes with at least one discoverer get drawn, as
+  // a small material-colored cluster of rocks/clods on their tile.
+  updateResourceNodes(nodes) {
+    if (this._resourceGfx) this.resourceLayer.removeChild(this._resourceGfx);
+    const g = new Graphics();
+    const MAT_COLS = {
+      clay: 0x9a7860, copper: 0x3fae7a, flint: 0x2a2a32,
+      coal: 0x1a1a1a, charcoal: 0x2a2622, copper_ingot: 0xc87a3a,
+    };
+    for (const n of nodes || []) {
+      if (!n.discoveredBy || Object.keys(n.discoveredBy).length === 0) continue;
+      const cx = n.x * T + T / 2, cy = n.y * T + T / 2;
+      const col = MAT_COLS[n.material] || 0x888888;
+      // a darker exposed-earth patch under the deposit so it reads against grass
+      g.ellipse(cx, cy + 1, 10, 6).fill({ color: 0x000000, alpha: 0.18 });
+      g.ellipse(cx, cy, 9, 5).fill({ color: col, alpha: 0.12 });
+      // a richer cluster of nuggets/clods (6, varied sizes) with shading
+      for (let i = 0; i < 6; i++) {
+        const ang = i * 1.05, rad = 2 + (i % 3) * 2.2;
+        const px = cx + Math.cos(ang) * rad, py = cy + Math.sin(ang) * rad * 0.7;
+        const r = 1.8 + (i % 3);
+        g.circle(px, py + 1, r).fill({ color: 0x000000, alpha: 0.2 });      // drop shadow
+        g.circle(px, py, r).fill(col);
+        g.circle(px - r * 0.3, py - r * 0.3, r * 0.45).fill({ color: 0xffffff, alpha: 0.28 }); // highlight
+      }
+      // faint shimmer ring so the eye catches a fresh discovery
+      const pulse = 0.25 + 0.2 * (0.5 + 0.5 * Math.sin(this._animFrame * 0.06 + n.x));
+      g.circle(cx, cy, 9).stroke({ color: col, width: 1.2, alpha: pulse });
+    }
+    this._resourceGfx = g;
+    this.resourceLayer.addChild(g);
+  }
+
   // ── DAY/NIGHT ──
 
   updateDayNight(timeOfDay, hourFloat) {
@@ -1310,5 +1433,18 @@ export class GameRenderer {
     this.viewport.y += (ty - this.viewport.y) * 0.08;
   }
 
-  destroy() { this.app?.destroy(true, { children: true }); }
+  destroy() {
+    for (const { target, type, handler, opts } of this._listeners || []) {
+      target.removeEventListener(type, handler, opts);
+    }
+    this._listeners = [];
+    this._resizeObserver?.disconnect();
+    this._resizeObserver = null;
+    if (this._zoomRaf) { cancelAnimationFrame(this._zoomRaf); this._zoomRaf = null; }
+    // app.destroy() tears down the shared ticker (and our _tick callback with it)
+    this.app?.destroy(true, { children: true });
+    this.app = null;
+    // allow terrain to rebuild if this instance is ever re-init()'d
+    this._terrainBuilt = false;
+  }
 }

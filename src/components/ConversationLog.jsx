@@ -19,7 +19,7 @@ export function ConversationLog({ activeConversations = [], pastConversations, p
   const recentEvents = events.slice(-8).filter(e =>
     e.type === 'ambient' || e.type === 'death' || e.type === 'god' || e.type === 'seasonal' ||
     e.type === 'partnership' || e.type === 'pregnancy' || e.type === 'birth' || e.type === 'breakup' ||
-    e.type === 'conflict' || e.type === 'building'
+    e.type === 'conflict' || e.type === 'building' || e.type === 'kindness'
   );
 
   return (

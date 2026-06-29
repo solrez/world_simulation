@@ -1,6 +1,6 @@
 export const TILE = 32;
-export const MAP_W = 30;
-export const MAP_H = 22;
+export const MAP_W = 44;
+export const MAP_H = 32;
 
 export const TERRAIN = {
   GRASS: 0,
@@ -10,16 +10,18 @@ export const TERRAIN = {
   DIRT: 4,
 };
 
+// Locations spread across the larger 44×32 map. The Campfire sits central as the
+// social hub; resource/solitude spots ring the edges so villagers actually travel.
 export const LOCATIONS = {
-  CAMPFIRE: { x: 14, y: 10, name: 'Campfire', type: 'social' },
-  WELL: { x: 20, y: 8, name: 'Well', type: 'resource' },
-  TREE_GROVE: { x: 6, y: 5, name: 'Grove', type: 'wood' },
-  POND: { x: 24, y: 15, name: 'Pond', type: 'solitude' },
-  MEADOW: { x: 8, y: 16, name: 'Meadow', type: 'thatch' },
-  ROCK_SEAT: { x: 18, y: 4, name: 'Rock Seat', type: 'stone' },
-  BERRY_BUSH: { x: 4, y: 12, name: 'Berry Bush', type: 'food' },
-  FISHING_SPOT: { x: 22, y: 14, name: 'Fishing Spot', type: 'food' },
-  FIELD: { x: 12, y: 18, name: 'Field', type: 'farm' },
+  CAMPFIRE: { x: 22, y: 16, name: 'Campfire', type: 'social' },
+  WELL: { x: 29, y: 12, name: 'Well', type: 'resource' },
+  TREE_GROVE: { x: 8, y: 6, name: 'Grove', type: 'wood' },
+  POND: { x: 35, y: 23, name: 'Pond', type: 'solitude' },
+  MEADOW: { x: 11, y: 24, name: 'Meadow', type: 'thatch' },
+  ROCK_SEAT: { x: 27, y: 5, name: 'Rock Seat', type: 'stone' },
+  BERRY_BUSH: { x: 6, y: 17, name: 'Berry Bush', type: 'food' },
+  FISHING_SPOT: { x: 33, y: 21, name: 'Fishing Spot', type: 'food' },
+  FIELD: { x: 18, y: 27, name: 'Field', type: 'farm' },
 };
 
 // ── Farming ──
@@ -161,19 +163,19 @@ export const PERSONALITIES = [
 // Each agent is assigned one of these at birth, so different people literally
 // "think" with different models — distinct voices, not just distinct prompts.
 // All are cheap, instruction-tuned, and reliably emit JSON. Routed through
-// OpenRouter (one key, one endpoint). Swap freely; unknown models just fall
-// back to null (reflex behavior) without breaking anything.
+// OpenRouter (one key, one endpoint). Swap freely; a model that 404s is retired
+// at runtime by the provider and transparently falls back to the default, so a
+// retired slug never hangs or spams the console (see openrouterProvider.js).
+// NOTE: these slugs churn — if you see "model unavailable" warnings, update here.
 export const MODEL_POOL = [
-  'meta-llama/llama-3.3-70b-instruct',
-  'meta-llama/llama-3.1-8b-instruct',
-  'mistralai/mistral-nemo',
-  'mistralai/mistral-7b-instruct',
-  'qwen/qwen-2.5-72b-instruct',
-  'qwen/qwen-2.5-7b-instruct',
-  'google/gemma-2-27b-it',
-  'google/gemma-2-9b-it',
-  'deepseek/deepseek-chat',
-  'nousresearch/hermes-3-llama-3.1-70b',
+  'qwen/qwen3.6-flash',
+  'deepseek/deepseek-v4-flash',
+  'google/gemma-4-31b-it',
+  'minimax/minimax-m2.7',
+  'mistralai/mistral-small-2603',
+  'minimax/minimax-m2.5',
+  'z-ai/glm-4.7-flash',
+  'nvidia/nemotron-3-nano-30b-a3b',
 ];
 
 export const MOODS = ['happy', 'neutral', 'sad', 'excited', 'thoughtful', 'anxious', 'flirty', 'annoyed', 'lonely', 'content', 'jealous', 'heartbroken', 'loving'];
@@ -261,6 +263,161 @@ export const CHILD_NAMES = {
 
 export const SKILLS = ['fishing', 'building', 'foraging', 'storytelling', 'healing', 'hunting', 'crafting', 'farming'];
 
+// ── Hidden resource nodes (Phase 1) ──
+// Raw materials that DON'T exist in the agents' world until someone "notices"
+// them. They sit on specific tiles, invisible on the map and absent from every
+// prompt, until an agent who is nearby AND curious/skilled/needy rolls a chance
+// to spot them. A noticed node seeds a personal discovery memory ("strange
+// greenish rocks near the creek") — the raw material the LLM ideates from later.
+//
+// Each node: a material id, a human description (what it LOOKS like to someone
+// who's never seen it — no modern words), the tile it sits on, the location it's
+// "near" (for memory text), how it's most likely found (the activity/skill that
+// makes a curious mind notice it), and a base per-tick notice chance.
+export const RESOURCE_NODES = [
+  { material: 'clay',   x: 36, y: 24, near: 'Pond',      look: 'a band of grey, sticky earth at the water\'s edge',   noticedBy: ['foraging', 'building'], base: 0.012 },
+  { material: 'clay',   x: 34, y: 25, near: 'Pond',      look: 'soft grey mud that holds its shape when squeezed',    noticedBy: ['foraging', 'building'], base: 0.012 },
+  { material: 'copper', x: 26, y: 4,  near: 'Rock Seat',  look: 'a vein of greenish rock streaked through the stone',  noticedBy: ['building', 'crafting'], base: 0.010 },
+  { material: 'copper', x: 28, y: 5,  near: 'Rock Seat',  look: 'odd green-blue rocks heavier than they look',         noticedBy: ['building', 'crafting'], base: 0.010 },
+  { material: 'flint',  x: 16, y: 13, near: 'the creek',  look: 'dark glassy stones that flake to a sharp edge',       noticedBy: ['foraging', 'hunting'],  base: 0.014 },
+  { material: 'flint',  x: 31, y: 17, near: 'the meadow', look: 'a scatter of hard dark nodules that spark when struck', noticedBy: ['foraging', 'hunting'], base: 0.014 },
+  { material: 'coal',   x: 9,  y: 7,  near: 'Grove',      look: 'a seam of black brittle rock exposed under a fallen tree', noticedBy: ['building', 'foraging'], base: 0.010 },
+  { material: 'coal',   x: 7,  y: 5,  near: 'Grove',      look: 'black stones that smudge your hands and won\'t wash off', noticedBy: ['building', 'foraging'], base: 0.010 },
+];
+
+// How close (in tiles) an agent must be to a node to have any chance of noticing
+// it, and the multipliers that make a curious/needy/skilled mind more observant.
+//
+// PACING: `RATE_MULT` is a single global dial on how fast the whole tech tree
+// unfolds. 1 = slow/realistic (inventions over many in-game days); raise it to
+// see the system in action within minutes. It scales both the per-tick notice
+// chance (here) and the ideation trigger (in GATE.IDEA). Tune freely.
+export const DISCOVERY = {
+  RANGE: 3,                   // tiles (a bit wider so passing near a node counts)
+  RATE_MULT: 6,               // global tech-pacing dial (1 = slow, higher = faster)
+  CURIOSITY_MULT: 2.2,        // ×chance if a 'curious' or 'observant' trait
+  CREATIVITY_MULT: 1.6,       // ×chance if a 'creative' trait
+  SKILL_MULT_PER_10: 0.25,    // +0.25× per 10 points of the relevant skill
+  NEED_MULT: 1.8,             // ×chance when a pressing need is driving them (frustrated)
+  NIGHT_MULT: 0.4,            // harder to spot things in the dark
+};
+
+// Ideation trigger pacing (Phase 3), scaled by DISCOVERY.RATE_MULT at the gate.
+export const IDEA = {
+  BASE_CHANCE: 0.05,          // per-eligible-tick chance to fire an ideation call
+  COOLDOWN_MIN: 200,          // ticks before another ideation attempt (lo)
+  COOLDOWN_SPAN: 200,         // + up to this many (hi)
+};
+
+// ── Tech graph (Phase 2) — Copper Age, system-only & hidden ──
+// A DAG the AGENTS never see. The LLM ideates freely ("could I melt the green
+// rocks?"); the SYSTEM maps that proposal onto one of these nodes and checks
+// prerequisites. Unmet prereqs become the agent's next goal; a proposal that
+// matches nothing is silently rejected ("you can't figure it out — keep trying").
+//
+// Node fields:
+//   id, label                  — internal id + display name
+//   prereqMaterials            — materials that must have been NOTICED/owned to attempt
+//   prereqKnowledge            — tech ids that must already be known (by the agent or village)
+//   attemptsNeeded             — base prototyping attempts before a breakthrough is possible
+//   failureChance              — base per-attempt chance an attempt fails (mitigated by skill/tools)
+//   effect                     — machine-readable payoff, applied on breakthrough
+//   role                       — village role this invention confers (smith/potter/...) or null
+//   group                      — true if it needs more than one person (Phase 7)
+//   matches                    — keyword/regex hints the proposal-matcher uses to map free-text ideas
+export const TECH_GRAPH = {
+  fire_knowledge: {
+    id: 'fire_knowledge', label: 'Mastery of Fire',
+    prereqMaterials: ['wood'], prereqKnowledge: [],
+    attemptsNeeded: 2, failureChance: 0.3,
+    effect: { type: 'enable' }, role: null, group: false,
+    matches: ['fire', 'flame', 'burn', 'hotter', 'bonfire', 'kindle', 'spark', 'ember'],
+  },
+  charcoal: {
+    id: 'charcoal', label: 'Charcoal Burning',
+    prereqMaterials: ['wood'], prereqKnowledge: ['fire_knowledge'],
+    attemptsNeeded: 3, failureChance: 0.4,
+    effect: { type: 'material', material: 'charcoal' }, role: null, group: false,
+    matches: ['charcoal', 'char', 'smoulder', 'cover the fire', 'black wood', 'slow burn'],
+  },
+  clay_pottery: {
+    id: 'clay_pottery', label: 'Pottery',
+    prereqMaterials: ['clay'], prereqKnowledge: ['fire_knowledge'],
+    attemptsNeeded: 3, failureChance: 0.35,
+    effect: { type: 'storage', food: 0.4 }, // pots cut larder spoilage
+    role: 'potter', group: false,
+    matches: ['pot', 'pottery', 'clay', 'bowl', 'jar', 'fire the mud', 'bake the earth', 'vessel'],
+  },
+  copper_smelting: {
+    id: 'copper_smelting', label: 'Copper Smelting',
+    prereqMaterials: ['copper', 'charcoal'], prereqKnowledge: ['charcoal'],
+    attemptsNeeded: 5, failureChance: 0.55,
+    effect: { type: 'material', material: 'copper_ingot' }, role: 'smith', group: false,
+    matches: ['melt', 'smelt', 'green rock', 'metal', 'liquid stone', 'pour the rock', 'furnace'],
+  },
+  copper_axe: {
+    id: 'copper_axe', label: 'Copper Axe',
+    prereqMaterials: ['copper_ingot', 'wood'], prereqKnowledge: ['copper_smelting'],
+    attemptsNeeded: 3, failureChance: 0.4,
+    effect: { type: 'tool', tool: 'copper_axe', boosts: 'building', mult: 2.2 },
+    role: 'smith', group: false,
+    matches: ['axe', 'chop', 'metal blade', 'sharp tool', 'hatchet'],
+  },
+  copper_hoe: {
+    id: 'copper_hoe', label: 'Copper Hoe',
+    prereqMaterials: ['copper_ingot', 'wood'], prereqKnowledge: ['copper_smelting'],
+    attemptsNeeded: 3, failureChance: 0.4,
+    effect: { type: 'tool', tool: 'copper_hoe', boosts: 'farming', mult: 2.0 },
+    role: 'smith', group: false,
+    matches: ['hoe', 'till', 'dig the soil', 'farm tool', 'break the earth'],
+  },
+  plow: {
+    id: 'plow', label: 'The Plow',
+    prereqMaterials: ['copper_ingot', 'wood'], prereqKnowledge: ['copper_hoe'],
+    attemptsNeeded: 4, failureChance: 0.45,
+    effect: { type: 'farmYield', mult: 1.6 }, role: null, group: false,
+    matches: ['plow', 'plough', 'drag through the field', 'turn the soil', 'pull blade'],
+  },
+  drying_rack: {
+    id: 'drying_rack', label: 'Drying Rack',
+    prereqMaterials: ['wood'], prereqKnowledge: [],
+    attemptsNeeded: 2, failureChance: 0.25,
+    effect: { type: 'storage', food: 0.25 }, role: null, group: false,
+    matches: ['dry', 'drying', 'hang the meat', 'rack', 'preserve in the sun', 'lay out the fish'],
+  },
+  smokehouse: {
+    id: 'smokehouse', label: 'Smokehouse',
+    prereqMaterials: ['wood', 'charcoal'], prereqKnowledge: ['fire_knowledge', 'drying_rack'],
+    attemptsNeeded: 4, failureChance: 0.4,
+    effect: { type: 'storage', food: 0.6 }, role: null, group: false,
+    matches: ['smoke', 'smokehouse', 'smoke the meat', 'cure', 'hut for the fire'],
+  },
+  irrigation_ditch: {
+    id: 'irrigation_ditch', label: 'Irrigation Ditch',
+    prereqMaterials: ['wood'], prereqKnowledge: [],
+    attemptsNeeded: 5, failureChance: 0.45,
+    effect: { type: 'farmYield', mult: 1.5 }, role: null, group: true, // needs help to dig
+    matches: ['ditch', 'channel', 'carry water', 'dig a trench', 'water the field', 'canal', 'irrigate'],
+  },
+};
+
+// Materials produced/consumed by tech that aren't the four base food types or
+// wood/stone/thatch. Tracked per-agent in `inventory`.
+export const TECH_MATERIALS = ['clay', 'copper', 'flint', 'coal', 'charcoal', 'copper_ingot'];
+
+// Roles a villager can formalize into when they invent the right thing (Phase 7).
+export const TECH_ROLES = { potter: 'potter', smith: 'smith' };
+
+// ── Prototyping (Phase 4) ──
+export const PROTOTYPE = {
+  PROGRESS_PER_TICK: 0.02,        // base fill rate of the attempt bar (×skill/tool)
+  SKILL_PROGRESS_PER_10: 0.006,   // faster with relevant skill
+  FAIL_LEARN_BONUS: 0.06,         // each failure shaves this much off next failureChance
+  MATERIAL_COST_ON_FAIL: 1,       // units of a prereq material burned per failed attempt
+  REWARD_BREAKTHROUGH: 12,        // Q reward on success (big)
+  REP_BREAKTHROUGH: 6,            // reputation 'skilled' bump on success
+};
+
 // ── Food economy (typed food + larder + spoilage) ──
 // Each food type has a hunger-restore value and a spoilage rate (fraction lost
 // per game-day in the shared larder). Variety in diet gives a small mood lift.
@@ -344,6 +501,17 @@ export const WILDLIFE_TYPES = [
   { type: 'boar', speed: 0.15, fleeRange: 3, foodValue: 6, color: 0x6a4a30 },
   { type: 'bird', speed: 0.4, fleeRange: 8, foodValue: 1, color: 0x4080c0 },
 ];
+
+// Wildlife population management: keep huntable species from going extinct so the
+// hunting economy survives. Each prey species repopulates toward a target; wolves
+// stay rare and aren't actively maintained (they're a threat, not a resource).
+export const WILDLIFE_TARGETS = { deer: 4, rabbit: 5, bird: 4, boar: 2 };
+export const WILDLIFE_RESPAWN = {
+  CHECK_EVERY: 120,       // ticks between repopulation checks (responsive but cheap)
+  SPAWN_CHANCE: 0.5,      // chance to add one of a below-target species per check
+  CARCASS_PRUNE_AGE: 60,  // ticks a dead animal lingers before being removed
+  WOLF_CHANCE: 0.02,      // small chance per check to introduce a lone wolf if none
+};
 
 export const AMBIENT_EVENTS = {
   morning: [

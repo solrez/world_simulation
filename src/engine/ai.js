@@ -91,7 +91,10 @@ function repLabelFrom(rec) {
 function describeWorld(person, allPeople, state) {
   const reputation = state.reputation || {};
   const others = allPeople
-    .filter(p => p.name !== person.name && p.alive !== false)
+    // exclude the god avatar: it's player-controlled and shouldn't leak into a
+    // villager's autonomous world-reasoning. Direct encounters use a dedicated
+    // avatar-reply prompt instead.
+    .filter(p => p.name !== person.name && p.alive !== false && !p.isAvatar)
     .map(p => {
       const rel = person.relationships?.[p.name];
       const stage = rel?.stage || 'stranger';
@@ -113,11 +116,24 @@ function describeWorld(person, allPeople, state) {
     .map(w => `${w.type} near ${w.currentLocation}${w.tamed ? ' (tamed)' : ''}`)
     .join(', ');
 
-  const buildings = (state.buildings || [])
-    .map(b => `${b.type || 'home'} at (${Math.round(b.x)},${Math.round(b.y)})${b.owners ? ' owned by ' + b.owners.join('/') : ''}`)
-    .join(', ');
+  // Buildings the person could plausibly know about: ones near them now, plus
+  // their own home wherever it is. Villagers are NOT omniscient about every
+  // structure on the map — only what's in view / nearby landmarks they'd have
+  // passed. Ownership is shown so they know whose house it is.
+  const KNOWN_BUILD_RADIUS = 12; // stationary landmarks are knowable from farther than live sight
+  const describeBuilding = (b) => {
+    const mine = b.owners?.includes(person.name);
+    const who = mine ? 'yours' : (b.owners?.length ? b.owners.join('/') + "'s" : 'unclaimed');
+    return `${b.type || 'home'} at (${Math.round(b.x)},${Math.round(b.y)}) — ${who}`;
+  };
+  const nearbyBuildings = (state.buildings || []).filter(b => {
+    if (b.owners?.includes(person.name)) return true; // always aware of your own home
+    const dx = b.x - person.x, dy = b.y - person.y;
+    return Math.sqrt(dx * dx + dy * dy) <= KNOWN_BUILD_RADIUS;
+  });
+  const buildings = nearbyBuildings.map(describeBuilding).join(', ');
 
-  return { others, wildlife: wildlife || 'none spotted', buildings: buildings || 'none built yet' };
+  return { others, wildlife: wildlife || 'none spotted', buildings: buildings || 'none nearby' };
 }
 
 function personContext(person) {
@@ -166,7 +182,8 @@ You're being asked to decide because something INTERESTING is happening — a ch
 
 ${worldState.specialty ? `You've become the village's go-to for ${worldState.specialty} — it's part of who you are now.` : ''}
 ${worldState.myReputation ? `Around the village, people think of you as ${worldState.myReputation}. That reputation follows you.` : ''}
-You can also UPDATE YOUR GOALS if they no longer make sense. Drop goals that feel wrong, add new ones based on what's happened to you.`;
+You can also UPDATE YOUR GOALS if they no longer make sense. Drop goals that feel wrong, add new ones based on what's happened to you.
+${person.home ? `You have a home. In bad weather or danger you could invite a homeless person to shelter with you (action "offer_shelter", target their name) — a real kindness, or not your nature. Your call.` : ''}`;
 
   const learnedStr = (worldState.learned || []).filter(l => Math.abs(l.value) > 0.3)
     .map(l => `${l.action} (${l.value > 0 ? 'paying off' : 'disappointing'})`).join(', ');
@@ -221,7 +238,7 @@ What do you do? Think step by step as ${person.name}, then decide.
 
 JSON response:
 {
-  "action": "go_to/seek_person/rest/chop_wood/collect_stone/gather_thatch/gather_food/fish/farm/build/hunt/explore/sit_and_think/heal_person/craft",
+  "action": "go_to/seek_person/rest/chop_wood/collect_stone/gather_thatch/gather_food/fish/farm/build/hunt/explore/sit_and_think/heal_person/craft/offer_shelter",
   "target": "location name or person name or animal type",
   "reason": "why — one sentence, in first person as ${person.name}",
   "mood": "your mood now",
@@ -323,6 +340,63 @@ JSON:
   return result;
 }
 
+// ── AVATAR REPLY ──
+// A villager replies to the god's avatar walking among them. This needs its OWN
+// prompt: the normal dialogue prompt forbids acknowledging gods/divine presences
+// (to keep autonomous chatter grounded), which directly contradicts a stranger or
+// presence actually standing there. Here we explicitly frame the encounter so the
+// villager reacts in-character — wary/curious to a stranger, awed/unsettled to a
+// presence — while staying otherwise grounded in their primitive world.
+export async function generateAvatarReply(listener, avatar, others, state, history, signal) {
+  const rel = listener.relationships?.[avatar.name] || {};
+  const familiarity = rel.familiarity > 40 ? 'You have spoken with them several times now and are growing used to them.'
+    : rel.familiarity > 10 ? 'You have met them before, once or twice.'
+    : 'You have never met them before.';
+
+  const othersDesc = others.filter(p => p.name !== avatar.name).map(p => {
+    const r = listener.relationships?.[p.name] || {};
+    return `${p.name} (${r.stage || 'stranger'})`;
+  }).join(', ');
+
+  const divineFrame = avatar.divine
+    ? `Standing before you is something that is NOT an ordinary person — a powerful, luminous PRESENCE that calls itself "${avatar.name}". You can feel it in your chest; it does not seem entirely mortal. You might be awed, frightened, reverent, skeptical, or overwhelmed — react however ${listener.name} truly would. ${listener.awe > 40 ? 'You already sense a higher power has been watching the village.' : ''}`
+    : `Standing before you is a STRANGER who calls themselves "${avatar.name}" — someone you don't recognize from your small settlement, which almost never sees newcomers. You might be curious, cautious, welcoming, or suspicious — react however ${listener.name} truly would.`;
+
+  const systemPrompt = `You ARE ${listener.name}. ${listener.gender}, ${listener.age}, ${listener.lifeStage}.
+Personality: ${(listener.traits || []).join(', ')}. How you talk: ${listener.speechStyle}
+Mood: ${listener.mood}. ${personContext(listener)}
+
+${divineFrame}
+${familiarity}
+
+This is REAL and happening right now — do NOT pretend they aren't there. Speak to them directly, in your own voice, the way ${listener.name} actually would. Stay grounded in your primitive world otherwise (you still only know wood, stone, fire, plants, animals, water, the people and places of your settlement). Don't invent unrelated festivals or faraway towns.`;
+
+  const userPrompt = `WHERE: ${avatar.currentLocation}. ${state.timeOfDay}, day ${state.day}, ${state.weather}.
+${othersDesc ? `Others nearby: ${othersDesc}.` : 'No one else is close by.'}
+
+THE CONVERSATION SO FAR:
+${history.slice(-8).map(h => `${h.speaker}: "${h.text}"`).join('\n')}
+
+${history.length ? `${history[history.length - 1].speaker} just said: "${history[history.length - 1].text}"` : ''}
+Respond directly to what was just said — react to it, answer it, or ask something back. 1-3 sentences.
+
+JSON:
+{
+  "dialogue": "what you say to ${avatar.name}",
+  "addressed_to": "${avatar.name}",
+  "mood_after": "happy/neutral/sad/excited/thoughtful/anxious/flirty/annoyed/lonely/content/jealous/heartbroken/loving",
+  "internal_thought": "what you privately think about this encounter",
+  "relationship_changes": { "${avatar.name}": {"affection": 0, "trust": 0, "attraction": 0} },
+  "wants_to_continue": true or false
+}`;
+
+  const result = await callLLM(systemPrompt, userPrompt, 0.95, 350, 'avatar', signal, listener.model);
+  if (!result || typeof result.dialogue !== 'string' || !result.dialogue.trim()) return null;
+  history.push({ speaker: listener.name, text: result.dialogue });
+  if (history.length > 30) history.splice(0, history.length - 30);
+  return result;
+}
+
 // ── GOSSIP (#2) ──
 // The speaker passes along their read on an absent third party. The returned
 // `lean` lets the listener nudge their own belief toward the speaker's view —
@@ -362,6 +436,48 @@ JSON:
 }`;
   const result = await callLLM(systemPrompt, userPrompt, 0.9, 200, 'teach', signal, teacher.model);
   if (!result || typeof result.dialogue !== 'string' || !result.dialogue.trim()) return null;
+  return result;
+}
+
+// ── IDEATION (Phase 3) — constrained invention brainstorm ──
+//
+// The whole point is to constrain knowledge: the agent only knows what they've
+// personally seen and what they already know how to do. We NEVER tell them
+// what's possible or name any modern concept — they have to reach for it from
+// raw observation. The system then maps whatever they say onto the hidden tech
+// graph. A vague or off-graph idea is fine; the system just lets it fail.
+export async function generateIdeation(person, { need, noticed, knownTechniques }, signal) {
+  const systemPrompt = `You ARE ${person.name}, a person in a primitive settlement.
+Personality: ${person.traits.join(', ')}. ${person.speechStyle}
+
+You live in a PRIMITIVE settlement. You have NO concept of metal, gears, engines,
+electricity, machines, chemistry, or any modern thing — those words mean nothing
+to you. You only know what you have seen with your own eyes: wood, stone, clay,
+fire, plants, animals, water, dirt, and the strange materials you've come across.
+You think in terms of trying things — heating, mixing, shaping, striking,
+burying, soaking — to see what happens. You are resourceful and a little stubborn.`;
+
+  const userPrompt = `You're frustrated: ${need}.
+
+Things you've noticed out in the world (you don't know what they're good for):
+${noticed.map(n => `- ${n}`).join('\n')}
+
+What you already know how to do:
+${knownTechniques.length ? knownTechniques.map(k => `- ${k}`).join('\n') : '- nothing special yet, just the basics'}
+
+Is there something you could TRY making or doing with these — some experiment
+that might make your life easier? Don't worry about whether it'll work. Describe
+it the way YOU would, in plain words, as something you want to attempt.
+
+JSON:
+{
+  "idea": "one or two sentences, first person, what you want to try (e.g. 'I wonder if those green rocks would melt if I got the fire hot enough')",
+  "making": "a few words naming the thing you're trying to make or do",
+  "feeling": "your mood about it"
+}`;
+
+  const result = await callLLM(systemPrompt, userPrompt, 1.0, 250, 'ideation', signal, person.model);
+  if (!result || typeof result.idea !== 'string' || !result.idea.trim()) return null;
   return result;
 }
 

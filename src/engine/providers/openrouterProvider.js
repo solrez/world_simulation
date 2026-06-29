@@ -4,8 +4,21 @@
 // strip markdown fences and extract the first balanced {...} object.
 
 const DEFAULT_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const DEFAULT_MODEL = 'meta-llama/llama-3.1-8b-instruct';
+const DEFAULT_MODEL = 'qwen/qwen3.6-flash';
 const TIMEOUT_MS = 20000; // a slow free-tier model shouldn't stall an agent forever
+
+// Models that returned a hard "this model doesn't exist" error (404 / 400). These
+// slugs churn on OpenRouter, and a dead one would otherwise 404 on every single
+// tick — spamming the console and wasting a round-trip per agent forever. Once a
+// model is known-dead we stop sending it and transparently fall back, so one
+// retired slug can't degrade the whole sim. Module-level so it's shared across
+// all calls for the session.
+const deadModels = new Set();
+// Status codes that mean "this exact model can't be served" (vs. transient 429/5xx
+// which we must NOT blacklist — those should keep retrying).
+const DEAD_STATUSES = new Set([400, 404]);
+// Sentinel distinguishing "model is dead, fall back" from "call failed, return null".
+const DEAD = Symbol('dead-model');
 
 // Pull the first JSON object out of a model reply, tolerating ```json fences,
 // leading prose, and trailing commentary. Returns null if nothing parses.
@@ -44,8 +57,28 @@ export class OpenRouterProvider {
 
   async complete({ system, user, temperature = 0.9, maxTokens = 500, model, signal }) {
     if (!this.apiKey) return null;
-    const useModel = model || this.defaultModel;
 
+    const requested = model || this.defaultModel;
+    // If the requested model is known-dead, don't even try it — go straight to the
+    // default (unless the default is itself dead, in which case bail to reflex).
+    let useModel = deadModels.has(requested) ? this.defaultModel : requested;
+    if (deadModels.has(useModel)) return null;
+
+    const result = await this._send({ system, user, temperature, maxTokens, model: useModel, signal });
+
+    // A dead-model response on a non-default model: blacklist it and retry ONCE
+    // with the default so this agent's turn still gets a real answer.
+    if (result === DEAD && useModel !== this.defaultModel && !deadModels.has(this.defaultModel)) {
+      return await this._send({ system, user, temperature, maxTokens, model: this.defaultModel, signal })
+        .then(r => (r === DEAD ? null : r));
+    }
+    return result === DEAD ? null : result;
+  }
+
+  // One HTTP round-trip. Returns parsed JSON, the DEAD sentinel if the model is
+  // unavailable (so the caller can blacklist + fall back), or null on any other
+  // failure (transient error, timeout, abort, unparseable reply).
+  async _send({ system, user, temperature, maxTokens, model, signal }) {
     // combine the caller's abort signal with a per-call timeout
     const timer = new AbortController();
     const to = setTimeout(() => timer.abort(), TIMEOUT_MS);
@@ -63,7 +96,7 @@ export class OpenRouterProvider {
           'X-Title': 'Village Life',
         },
         body: JSON.stringify({
-          model: useModel,
+          model,
           messages: [
             { role: 'system', content: system },
             { role: 'user', content: user },
@@ -74,12 +107,23 @@ export class OpenRouterProvider {
           response_format: { type: 'json_object' },
         }),
       });
-      if (!resp.ok) { console.warn(`OpenRouter error (${useModel}):`, resp.status); return null; }
+      if (!resp.ok) {
+        if (DEAD_STATUSES.has(resp.status)) {
+          // retire this slug for the rest of the session (warn only on first sight)
+          if (!deadModels.has(model)) {
+            deadModels.add(model);
+            console.warn(`OpenRouter: model "${model}" unavailable (${resp.status}) — retiring it and falling back.`);
+          }
+          return DEAD;
+        }
+        console.warn(`OpenRouter error (${model}):`, resp.status);
+        return null;
+      }
       const data = await resp.json();
       const text = data.choices?.[0]?.message?.content;
       return extractJSON(text);
     } catch (e) {
-      if (e.name !== 'AbortError') console.warn(`AI error (${useModel}):`, e.message);
+      if (e.name !== 'AbortError') console.warn(`AI error (${model}):`, e.message);
       return null;
     } finally {
       clearTimeout(to);

@@ -1,7 +1,8 @@
-import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, SKILLS, AMBIENT_EVENTS, BUILD_REQUIREMENTS, BUILD_PHASES, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, MODEL_POOL, CHRONOTYPE_OFFSET, CHRONOTYPE_TRAITS, GROVE_DEPLETE, GROVE_REGROW_PER_DAY, POND_LEVEL_MAX, POND_LEVEL_MIN, POND_RAIN_GAIN, POND_EVAP, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, MODEL_SMOOTHING, MODEL_WEIGHT_FLOOR } from '../utils/constants.js';
+import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, MODEL_POOL, CHRONOTYPE_OFFSET, CHRONOTYPE_TRAITS, GROVE_DEPLETE, GROVE_REGROW_PER_DAY, POND_LEVEL_MAX, POND_LEVEL_MIN, POND_RAIN_GAIN, POND_EVAP, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, MODEL_SMOOTHING, MODEL_WEIGHT_FLOOR, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN } from '../utils/constants.js';
 import { buildWalkableGrid, findPath, nearestWalkable } from './pathfinding.js';
-import { nearestVisiblePrey } from './vision.js';
-import { generateGroupDialogue, generateAction, generateGossip, generateTeaching } from './ai.js';
+import { clearCompletedGoal } from './goals.js';
+import { nearestVisiblePrey, perceive } from './vision.js';
+import { generateGroupDialogue, generateAction, generateGossip, generateTeaching, generateIdeation, generateAvatarReply } from './ai.js';
 
 // ── Conversation Archive (persisted to localStorage) ──
 
@@ -36,7 +37,7 @@ export async function getConversationArchiveFromDisk() {
   try {
     const resp = await fetch('/api/conversations');
     if (resp.ok) return resp.json();
-  } catch {}
+  } catch { /* server unavailable — fall back to localStorage below */ }
   return getConversationArchive(); // fallback to localStorage
 }
 
@@ -98,20 +99,39 @@ export function downloadFullWorldState(gameState) {
 
 function generateTerrain() {
   const map = [];
+  const pond = LOCATIONS.POND;
+  const fishing = LOCATIONS.FISHING_SPOT;
+  // a meandering stream runs diagonally and feeds the pond — drawn as a sine
+  // wave in x as it descends, giving the bigger map a natural water feature.
+  const streamX = (y) => Math.round(pond.x - 6 + Math.sin(y * 0.4) * 3 - (MAP_H - y) * 0.15);
   for (let y = 0; y < MAP_H; y++) {
     const row = [];
     for (let x = 0; x < MAP_W; x++) {
       let type = TERRAIN.GRASS;
-      const px = x - 24, py = y - 15;
-      if (px * px + py * py < 6) type = TERRAIN.WATER;
-      const dx = x - 14, dy = y - 10;
-      if (Math.sqrt(dx * dx + dy * dy) < 1.5) type = TERRAIN.DIRT;
+      // a larger pond centred on the POND location (radius scales with the map)
+      const px = x - pond.x, py = y - pond.y;
+      if (px * px + py * py < 14) type = TERRAIN.WATER;
+      // a second smaller pool by the fishing spot
+      const qx = x - fishing.x, qy = y - fishing.y;
+      if (qx * qx + qy * qy < 5) type = TERRAIN.WATER;
+      // the stream (only in the lower half so it reads as feeding the pond)
+      if (y > MAP_H * 0.45 && y < pond.y && x === streamX(y)) type = TERRAIN.WATER;
+      // dirt clearing at the campfire hub
+      const dx = x - LOCATIONS.CAMPFIRE.x, dy = y - LOCATIONS.CAMPFIRE.y;
+      if (Math.sqrt(dx * dx + dy * dy) < 2) type = TERRAIN.DIRT;
       // tilled field plot around the Field location
       const fx = x - LOCATIONS.FIELD.x, fy = y - LOCATIONS.FIELD.y;
-      if (Math.abs(fx) <= 2 && Math.abs(fy) <= 1) type = TERRAIN.DIRT;
-      if (y === 10 && x >= 12 && x <= 16) type = TERRAIN.PATH;
-      if (x === 14 && y >= 8 && y <= 12) type = TERRAIN.PATH;
-      if ((x + y * 7) % 13 === 0 && type === TERRAIN.GRASS) type = TERRAIN.FLOWERS;
+      if (Math.abs(fx) <= 3 && Math.abs(fy) <= 2) type = TERRAIN.DIRT;
+      // rocky/dirt ground around Rock Seat (where copper hides)
+      const rx = x - LOCATIONS.ROCK_SEAT.x, ry = y - LOCATIONS.ROCK_SEAT.y;
+      if (rx * rx + ry * ry < 8 && type === TERRAIN.GRASS) type = TERRAIN.DIRT;
+      // wildflower meadows: denser near the Meadow location, sparse elsewhere
+      const mx = x - LOCATIONS.MEADOW.x, my = y - LOCATIONS.MEADOW.y;
+      const nearMeadow = mx * mx + my * my < 20;
+      if (type === TERRAIN.GRASS) {
+        if (nearMeadow && (x + y * 3) % 4 === 0) type = TERRAIN.FLOWERS;
+        else if ((x + y * 7) % 17 === 0) type = TERRAIN.FLOWERS;
+      }
       row.push({ type, variant: (x * 31 + y * 17) % 3 });
     }
     map.push(row);
@@ -122,6 +142,7 @@ function generateTerrain() {
     [LOCATIONS.CAMPFIRE, LOCATIONS.ROCK_SEAT], [LOCATIONS.CAMPFIRE, LOCATIONS.BERRY_BUSH],
     [LOCATIONS.WELL, LOCATIONS.FISHING_SPOT],
     [LOCATIONS.CAMPFIRE, LOCATIONS.FIELD],
+    [LOCATIONS.BERRY_BUSH, LOCATIONS.MEADOW], [LOCATIONS.ROCK_SEAT, LOCATIONS.WELL],
   ];
   for (const [a, b] of pathPairs) {
     const steps = Math.max(Math.abs(b.x - a.x), Math.abs(b.y - a.y));
@@ -221,7 +242,7 @@ const AMBITION_POOL = [
   { id: 'explore_all', label: 'Visit every location', check: () => false },
 ];
 
-function generateAmbitions(config) {
+function generateAmbitions() {
   const pool = [...AMBITION_POOL];
   const ambitions = [];
   const count = 2 + Math.floor(Math.random() * 2); // 2-3 ambitions
@@ -291,7 +312,7 @@ function initPerson(config, index, startX, startY) {
     // alive
     alive: true,
     // ambitions — generated at init
-    ambitions: generateAmbitions(config),
+    ambitions: generateAmbitions(),
     // grief
     griefTimer: 0,
     griefTarget: null,
@@ -307,8 +328,9 @@ function initPerson(config, index, startX, startY) {
     favoriteLocation: null,
     // each agent's private read on others (gossip nudges these); keyed by name
     reputationBeliefs: {},
-    // inventory (materials) + typed food larder
-    inventory: { wood: 0, stone: 0, thatch: 0 },
+    // inventory (materials) + typed food larder. Tech materials (clay, copper,
+    // flint, coal, charcoal, copper_ingot) start at 0 and accrue once noticed/made.
+    inventory: { wood: 0, stone: 0, thatch: 0, clay: 0, copper: 0, flint: 0, coal: 0, charcoal: 0, copper_ingot: 0 },
     larder: { meat: 0, fish: 0, berries: 3, crops: 0 },
     lastEaten: null,
     // crafted tools that boost gathering yields, plus in-progress craft state
@@ -327,6 +349,13 @@ function initPerson(config, index, startX, startY) {
     buildProject: null,
     // conversation log — actual past dialogues stored per person
     conversationLog: [], // [{participants: [], lines: [{speaker, text}], day, location}]
+    // ── invention / tech (Phases 1-5) ──
+    noticedResources: {},   // { [material]: { near, look, day } } — what they've personally spotted
+    knownTech: {},          // { [techId]: true } — inventions THIS person can do
+    prototype: null,        // { techId, label, progress, attemptsLeft, failureChance } while experimenting
+    techRole: null,         // 'smith' | 'potter' | ... once they invent the right thing
+    ideaCooldown: 0,        // ticks before another ideation call
+    pendingIdea: false,     // flagged by the gate → App fires runIdeation
   };
 }
 
@@ -388,6 +417,15 @@ export function createSimulation() {
     pond: { level: 1 },
     // collective village reputation: { [name]: { generous, kind, skilled, ... } }
     reputation,
+    // ── invention / tech (Phases 1,2,5) ──
+    // Hidden resource nodes on the map. `discoveredBy` is the set of names who've
+    // noticed each (renderer reveals a node once anyone has). Cloned from the
+    // constant so per-run discovery state lives on state, not the module.
+    resourceNodes: RESOURCE_NODES.map((n, i) => ({ ...n, id: i, discoveredBy: {} })),
+    // village knowledge pool: { [techId]: { by, day } } — someone alive once knew it.
+    knownTech: {},
+    // chronicle of breakthroughs (for the Invention Log panel): { techId, label, by, day }
+    inventions: [],
     // per-model reliability stats for the assignment router (#8)
     modelStats: {},
     stats: { totalBirths: 0, totalDeaths: 0, totalPartnerships: 0, totalConversations: 0 },
@@ -498,15 +536,55 @@ function updateWildlife(state) {
     animal.currentLocation = locationAt(animal.x, animal.y);
   }
 
-  // respawn animals occasionally
-  if (state.tick % 500 === 0) {
-    const aliveCount = state.wildlife.filter(w => w.alive).length;
-    if (aliveCount < 5) {
-      const types = ['rabbit', 'deer', 'bird'];
-      const type = types[Math.floor(Math.random() * types.length)];
-      state.wildlife.push(createAnimal(type, Math.random() * MAP_W, Math.random() * MAP_H));
+  // ── population management ── prune old carcasses and repopulate prey species
+  // that have dropped below their target, so hunting stays sustainable and the
+  // map never empties out. Runs on a short cadence to feel responsive.
+  if (state.tick % WILDLIFE_RESPAWN.CHECK_EVERY === 0) {
+    // remove carcasses that have lingered long enough (keeps the array bounded)
+    state.wildlife = state.wildlife.filter(w =>
+      w.alive || (state.tick - (w._diedTick ?? 0)) < WILDLIFE_RESPAWN.CARCASS_PRUNE_AGE);
+
+    // count living animals per species
+    const counts = {};
+    for (const w of state.wildlife) if (w.alive) counts[w.type] = (counts[w.type] || 0) + 1;
+
+    // any prey species below target → a chance to spawn one (near its preferred
+    // area when we have one, else anywhere on grass)
+    const below = Object.entries(WILDLIFE_TARGETS).filter(([t, target]) => (counts[t] || 0) < target);
+    if (below.length && Math.random() < WILDLIFE_RESPAWN.SPAWN_CHANCE) {
+      // bias toward the species furthest below its target
+      below.sort((a, b) => ((counts[a[0]] || 0) - a[1]) - ((counts[b[0]] || 0) - b[1]));
+      const type = below[0][0];
+      const spot = spawnSpotFor(type, state);
+      state.wildlife.push(createAnimal(type, spot.x, spot.y));
+    }
+
+    // wolves: a lone predator wanders in rarely if none is around (a threat, not
+    // a managed resource) — keeps danger present without overrunning the map.
+    const wolves = (counts.wolf || 0);
+    if (wolves === 0 && Math.random() < WILDLIFE_RESPAWN.WOLF_CHANCE) {
+      state.wildlife.push(createAnimal('wolf', MAP_W - 3 - Math.random() * 3, 2 + Math.random() * 4));
     }
   }
+}
+
+// Pick a plausible spawn point for a species: deer/boar favor the wooded grove
+// area, birds & rabbits scatter. Always lands on non-water ground.
+function spawnSpotFor(type, state) {
+  const grove = LOCATIONS.TREE_GROVE;
+  for (let tries = 0; tries < 20; tries++) {
+    let x, y;
+    if (type === 'deer' || type === 'boar') {
+      x = grove.x + (Math.random() - 0.5) * 10;
+      y = grove.y + (Math.random() - 0.5) * 10;
+    } else {
+      x = Math.random() * MAP_W;
+      y = Math.random() * MAP_H;
+    }
+    x = clamp(x, 1, MAP_W - 2); y = clamp(y, 1, MAP_H - 2);
+    if (state.terrain?.[Math.round(y)]?.[Math.round(x)]?.type !== TERRAIN.WATER) return { x, y };
+  }
+  return { x: grove.x, y: grove.y };
 }
 
 // ── Hunting: continuous active pursuit ──
@@ -549,6 +627,7 @@ function processHunting(person, state) {
     const catchChance = (0.30 + huntSkill * 0.006) * seasonHunt;
     if (Math.random() < catchChance) {
       prey.alive = false;
+      prey._diedTick = state.tick; // for carcass pruning in updateWildlife
       const meat = Math.max(2, Math.round(prey.foodValue));
       addFood(person, 'meat', meat);
       person.foodGathered = (person.foodGathered || 0) + meat;
@@ -729,7 +808,11 @@ function pickTarget(person, people, state) {
   // daily routine drives behavior
   switch (schedule) {
     case 'sleep':
-      if (person.tiredness > 30) return; // let needsDriven handle sleep
+      // it's their bedtime. If they own a home and are at all tired, head there to
+      // sleep (this is what makes a built house visibly used at night). The
+      // walk-home-then-sleep is handled by beginSleep.
+      if (person.home && person.tiredness > 15) { beginSleep(person, 500); return; }
+      if (person.tiredness > 30) return; // otherwise let the reflex handle it
       // those still awake on their clock wander rather than freeze
       if (person.chronotype === 'night' || person.traits.includes('restless') || Math.random() < 0.2) {
         goToLocation(person, person.favoriteLocation || 'Campfire');
@@ -849,9 +932,11 @@ function locationValence(person, locName) {
 // Signed feeling about another person, by name, from memories that mention them.
 function personValence(person, otherName) {
   if (!person.memories?.length || !otherName) return 0;
+  // Match the name as a whole word so e.g. "Mara" doesn't match "Marabel".
+  const nameRe = new RegExp(`\\b${otherName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
   let sum = 0;
   for (const m of person.memories) {
-    if (m.valence && m.text && m.text.includes(otherName)) sum += m.weight * Math.sign(m.valence);
+    if (m.valence && m.text && nameRe.test(m.text)) sum += m.weight * Math.sign(m.valence);
   }
   return sum;
 }
@@ -954,6 +1039,8 @@ function updateRelationshipStage(person, otherName, people) {
     setEmote(other, 'heart', 40);
     addMemory(person, `Started dating ${other.name}!`, 'life', 0);
     addMemory(other, `Started dating ${person.name}!`, 'life', 0);
+    // a new couple shares a home: if one already has one, the other moves in
+    shareHomeWithPartner(person, other);
   }
 }
 
@@ -1078,7 +1165,7 @@ function escalationGate(person, people, state) {
     //    season (everyone wants a home; fall/winter just makes it urgent). Higher
     //    chance as cold approaches so houses actually get built before winter.
     if (!person.home && person.lifeStage === LIFE_STAGES.ADULT && !person.buildProject) {
-      const urgency = (state.season === 'fall' || state.season === 'winter') ? 0.06 : 0.025;
+      const urgency = (state.season === 'fall' || state.season === 'winter') ? 0.12 : 0.06;
       if (Math.random() < urgency) return { verdict: 'ESCALATE' };
     }
 
@@ -1097,9 +1184,72 @@ function escalationGate(person, people, state) {
         totalFood(state) < 25 && Math.random() < 0.04) {
       return { verdict: 'ESCALATE' };
     }
+
+    // 8. IDEATION (Phase 3) — a frustrated, inventive mind who's noticed raw
+    //    materials gets the urge to TRY something. Routed to a separate
+    //    constrained LLM call (pendingIdea), not the normal action prompt, so we
+    //    flag it and let the tick continue with local behavior this turn.
+    if (person.ideaCooldown <= 0 && !person.prototype &&
+        Object.keys(person.noticedResources || {}).length > 0 &&
+        (person.traits?.includes('curious') || person.traits?.includes('creative') || person.traits?.includes('handy')) &&
+        pressingNeed(person, state) && Math.random() < IDEA.BASE_CHANCE * (DISCOVERY.RATE_MULT || 1)) {
+      person.pendingIdea = true;
+    }
   }
 
   return { verdict: 'IDLE' };
+}
+
+// Begin sleeping. If the person has a home they aren't already at, walk there
+// FIRST (heading-home state) and only drop into actual sleep on arrival — this is
+// what makes a built house get used. Without a home (or already home) they sleep
+// in place immediately, as before. The `_sleepWhenHome` flag is consumed by the
+// movement block in the main tick when they reach the house.
+function beginSleep(person, duration) {
+  setGoal(person, 'sleep', null, duration);
+  // Only sleep in place when essentially ON the house (within ~0.7 tile). Anything
+  // further and they walk all the way home first, so they visibly sleep AT the
+  // building rather than a tile or two beside it.
+  const nearHome = person.home &&
+    Math.abs(person.x - person.home.x) < 0.7 && Math.abs(person.y - person.home.y) < 0.7;
+  if (person.home && !nearHome) {
+    // head home, awake, then sleep once we arrive
+    person._sleepWhenHome = true;
+    person.targetX = person.home.x; person.targetY = person.home.y;
+    person.activity = 'heading home';
+    setEmote(person, 'zzz', 999);
+    person.thought = 'Tired — heading home to rest.';
+  } else {
+    sleepNow(person);
+  }
+}
+
+// Drop into actual sleep wherever the person currently stands.
+function sleepNow(person) {
+  // snap exactly onto the home so the sleeper visibly rests inside the building,
+  // not a fraction of a tile off-center.
+  if (person.home && Math.abs(person.x - person.home.x) < 2 && Math.abs(person.y - person.home.y) < 2) {
+    person.x = person.home.x; person.y = person.home.y;
+  }
+  person.sleeping = true;
+  person.activity = 'sleeping';
+  person._sleepWhenHome = false;
+  person.targetX = null; person.targetY = null;
+  person.path = null; person._pathDest = null;
+  setEmote(person, 'zzz', 999);
+}
+
+// When two villagers pair up, a homeless partner moves into the other's home (and
+// joins its owners). If both already have homes, they keep their own — no merge.
+function shareHomeWithPartner(a, b) {
+  const home = a.home || b.home;
+  if (!home) return;
+  for (const p of [a, b]) {
+    if (!p.home) {
+      p.home = home;
+      if (home.owners && !home.owners.includes(p.name)) home.owners.push(p.name);
+    }
+  }
 }
 
 // Apply a single-answer reflex locally — no LLM, no discretion.
@@ -1114,12 +1264,7 @@ function applyReflex(person, reflex, state) {
   }
   switch (reflex) {
     case 'sleep': {
-      person.sleeping = true;
-      person.activity = 'sleeping';
-      person.targetX = null; person.targetY = null;
-      setEmote(person, 'zzz', 999);
-      setGoal(person, 'sleep', null, person.sick ? 200 : 500);
-      if (person.home) { person.targetX = person.home.x; person.targetY = person.home.y; }
+      beginSleep(person, person.sick ? 200 : 500);
       break;
     }
     case 'eat': {
@@ -1199,6 +1344,47 @@ function processFoodSharing(person, people, state) {
       if (other.relationships[person.name]) other.relationships[person.name].affection = clamp(other.relationships[person.name].affection - 1, 0, 100);
       addMemory(other, `${person.name} wouldn't share food while I was starving`, 'conflict', state.day, { location: other.currentLocation });
     }
+  }
+}
+
+// Phase 7 — barter. When two villagers who aren't close enough to just GIVE meet
+// and each holds a surplus the other lacks, they trade ("a copper knife for
+// three fish"). This is the seed of an economy: goods move toward who needs them,
+// and the exchange builds a little trust. Throttled so it's occasional, not spammy.
+const TRADE_GOODS = ['meat', 'fish', 'crops', 'berries', 'copper_ingot', 'flint', 'clay', 'wood', 'stone'];
+function holding(p, g) { return (p.larder?.[g] || 0) + (p.inventory?.[g] || 0); }
+function moveGood(p, g, n) {
+  // prefer pulling from larder for food, inventory for materials
+  if ((p.larder?.[g] || 0) >= n) { p.larder[g] -= n; return; }
+  if (p.inventory) p.inventory[g] = Math.max(0, (p.inventory[g] || 0) - n);
+}
+function giveGood(p, g, n) {
+  if (['meat', 'fish', 'crops', 'berries'].includes(g)) addFood(p, g, n);
+  else if (p.inventory) p.inventory[g] = (p.inventory[g] || 0) + n;
+}
+function processTrade(person, people, state) {
+  if (person.sleeping || person.eating || person.conversationId || Math.random() > 0.01) return;
+  for (const other of people) {
+    if (other.name === person.name || other.alive === false || other.sleeping) continue;
+    if (distBetween(person, other) > 3) continue;
+    // what does each have plenty of that the other is short on?
+    const mySurplus = TRADE_GOODS.find(g => holding(person, g) >= 4 && holding(other, g) <= 1);
+    const theirSurplus = TRADE_GOODS.find(g => g !== mySurplus && holding(other, g) >= 4 && holding(person, g) <= 1);
+    if (!mySurplus || !theirSurplus) continue;
+    // a simple 2-for-3 style swap
+    moveGood(person, mySurplus, 2); giveGood(other, mySurplus, 2);
+    moveGood(other, theirSurplus, 3); giveGood(person, theirSurplus, 3);
+    const rel = person.relationships[other.name];
+    if (rel) rel.trust = clamp(rel.trust + 1.5, 0, 100);
+    const orel = other.relationships[person.name];
+    if (orel) orel.trust = clamp(orel.trust + 1.5, 0, 100);
+    setEmote(person, 'sparkle', 8);
+    person.thought = `Traded ${mySurplus} with ${other.name} for some ${theirSurplus}.`;
+    addMemory(person, `Traded ${mySurplus} to ${other.name} for ${theirSurplus}.`, 'agreement', state.day, { location: person.currentLocation, valence: 0.5 });
+    addMemory(other, `${person.name} traded me ${mySurplus} for ${theirSurplus}.`, 'agreement', state.day, { location: other.currentLocation, valence: 0.5 });
+    state.events.push({ day: state.day, hour: state.hour, participants: [person.name, other.name],
+      summary: `🤝 ${person.name} and ${other.name} traded ${mySurplus} for ${theirSurplus}.`, type: 'trade' });
+    return;
   }
 }
 
@@ -1329,6 +1515,20 @@ function processLifeEvents(person, people, state, dayRolled) {
         rewardAction(person, 'build', 10, state); // big payoff: Q learns building is worth it
         addMemory(person, `Finished building a ${bp.type}${partner ? ` with ${partner.name}` : ''}!`, 'achievement', state.day, { location: person.currentLocation });
         state.events.push({ day: state.day, hour: state.hour, participants: [person.name, partner?.name].filter(Boolean), summary: `🏠 ${person.name} completed a ${bp.type}!`, type: 'building' });
+        // OTHERS NOTICE: villagers nearby witness the new building — they form a
+        // memory of it, admire the builder (awe + relationship), and the builder's
+        // "skilled" reputation grows. A finished house is a real social event.
+        bumpReputation(state, person.name, 'skilled', 3);
+        const WITNESS_RADIUS = 10;
+        for (const o of people) {
+          if (o.alive === false || o.isAvatar || o.name === person.name || o.name === partner?.name) continue;
+          if (distBetween(o, home) > WITNESS_RADIUS) continue;
+          addMemory(o, `Saw ${person.name} finish building a ${bp.type}.`, 'event', state.day,
+            { location: o.currentLocation, valence: 0.8 });
+          const rel = o.relationships[person.name];
+          if (rel) { rel.affection = clamp(rel.affection + 3, 0, 100); rel.familiarity = clamp(rel.familiarity + 2, 0, 100); }
+          setEmote(o, 'sparkle', 14);
+        }
         person.buildProject = null;
       } else {
         // show phases
@@ -1394,6 +1594,12 @@ function spawnChild(mother, father, people, state) {
   child.parents = [mother.name, father?.name].filter(Boolean);
   mother.children.push(name);
   if (father) father.children.push(name);
+  // a child is born into its parents' home (if either has one), not homeless
+  const parentHome = mother.home || father?.home || null;
+  if (parentHome) {
+    child.home = parentHome;
+    if (parentHome.owners && !parentHome.owners.includes(name)) parentHome.owners.push(name);
+  }
   addMemory(mother, `Gave birth to ${name}`, 'life', state.day);
   if (father) addMemory(father, `${name} was born`, 'life', state.day);
   return child;
@@ -1403,6 +1609,14 @@ function spawnChild(mother, father, people, state) {
 
 export function simulateTick(state) {
   if (state.paused) return state;
+  // Shallow clone ONLY. The engine deliberately keeps person (and wildlife/etc.)
+  // objects STABLE across ticks: async flows like runConversation/runAIAction/
+  // avatarSpeak capture a person reference and mutate it many ticks later (set/
+  // clear conversationId, apply AI-decided mood/goals). Deep-cloning people every
+  // tick orphans those captured references — e.g. a conversation would clear the
+  // lock on a stale copy while the live clone stayed frozen forever. So the tick
+  // mutates the existing objects in place by design; the snapshot identity that
+  // changes each tick is the top-level `next`, which is enough for React/render.
   const next = { ...state, tick: state.tick + 1 };
 
   // 1 game-minute per tick. At 400ms tick interval, 1 day = 1440 ticks = ~9.6 real minutes
@@ -1416,10 +1630,14 @@ export function simulateTick(state) {
   }
   next.timeOfDay = getTimeOfDay(next.hour);
 
-  const alivePeople = next.people.filter(p => p.alive !== false);
+  // The god avatar lives in `people` so it renders and can be perceived/talked
+  // to, but it is NOT an autonomous villager: exclude it from the simulation
+  // loops (no hunger, aging, death, escalation, matchmaking, etc.).
+  const alivePeople = next.people.filter(p => p.alive !== false && !p.isAvatar);
 
   for (const person of next.people) {
     if (person.alive === false) continue;
+    if (person.isAvatar) continue; // god-controlled — skip all autonomous processing
 
     if (person.conversationCooldown > 0) person.conversationCooldown--;
     if (person.actionCooldown > 0) person.actionCooldown--;
@@ -1428,6 +1646,9 @@ export function simulateTick(state) {
     if (person.currentGoal) {
       person.currentGoal.until--;
       if (person.currentGoal.until <= 0) person.currentGoal = null;
+      // early completion: clear the goal the moment it's actually accomplished,
+      // instead of waiting out the timer (see goals.js).
+      else clearCompletedGoal(person, next);
     }
 
     updateNeeds(person, next.timeOfDay, next.weather);
@@ -1438,6 +1659,11 @@ export function simulateTick(state) {
     // the prey's LIVE position via vision. Independent of the goal lock so it
     // actually completes (the old one-shot hunt never could).
     processHunting(person, next);
+    // ── invention/tech (Phases 1,4,5) ──
+    processDiscovery(person, next);        // notice hidden resources nearby
+    processPrototype(person, next);        // advance an in-progress experiment
+    processTechObservation(person, next);  // learn by watching someone use a tech
+    if (person.ideaCooldown > 0) person.ideaCooldown--;
     if (dayRolled) decayMemories(person, next);
     processBreakups(person, alivePeople, next);
     processIllness(person, next);
@@ -1445,7 +1671,7 @@ export function simulateTick(state) {
     processAmbitions(person, next);
     processPersonalityConflict(person, alivePeople, next);
     processFrailty(person, alivePeople, next, dayRolled);
-    processAdultTeaching(person, alivePeople);
+    processAdultTeaching(person, alivePeople, next);
 
     for (const otherName of Object.keys(person.relationships))
       updateRelationshipStage(person, otherName, alivePeople);
@@ -1498,6 +1724,13 @@ export function simulateTick(state) {
 
     if (person.conversationId) continue;
     if (person.sleeping) continue;
+    // heading home to sleep, but the sleep urge lapsed (goal expired) before
+    // arriving — don't wander off mid-trip; just sleep where they are.
+    if (person._sleepWhenHome && (!person.currentGoal || person.currentGoal.type !== 'sleep')) {
+      sleepNow(person);
+      person.currentLocation = locationAt(person.x, person.y);
+      continue;
+    }
     if (person.eating) {
       const curLoc = locationAt(person.x, person.y);
       const foodLocs = Object.values(LOCATIONS).filter(l => l.type === 'food');
@@ -1506,6 +1739,7 @@ export function simulateTick(state) {
     }
 
     processFoodSharing(person, alivePeople, next);
+    processTrade(person, alivePeople, next);       // Phase 7: barter surpluses
 
     const gate = escalationGate(person, alivePeople, next);
     if (gate.verdict === 'REFLEX') {
@@ -1528,6 +1762,8 @@ export function simulateTick(state) {
       if (arrived) {
         person.currentLocation = locationAt(person.x, person.y);
         person.idle = 0;
+        // reached home while heading there to sleep → now actually sleep
+        if (person._sleepWhenHome) { sleepNow(person); person.currentLocation = locationAt(person.x, person.y); continue; }
         // opportunistic auto-eat on arrival — but NOT while in a conversation
         // (that would silently pull them out and kill the dialogue after 1 line)
         if (person.hunger > 40 && !person.conversationId) {
@@ -1785,6 +2021,334 @@ function qBestActions(person, state, n = 3) {
   return rows.slice(0, n);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// INVENTION & TECH  (Phases 1-5, 7)
+//
+// The agents never see the tech graph. They notice raw materials they're near,
+// the LLM ideates freely from what they've personally seen, and the SYSTEM maps
+// that idea onto the hidden DAG, validates prerequisites, and runs a multi-tick
+// prototyping loop where failure is productive. Knowledge then spreads by
+// observation and teaching, and dies with its holder unless it was passed on.
+// ════════════════════════════════════════════════════════════════════════════
+
+// Does this person have a "pressing need" sharp enough to make them inventive?
+// Frustration is the mother of invention: a tired builder eyeing hard rocks, a
+// hungry farmer wishing the soil turned easier. Returns a short phrase or null.
+function pressingNeed(person, state) {
+  if (person.hunger > GATE.HUNGER_BAND[0]) return 'always hungry — gathering food by hand is exhausting';
+  if (person.tiredness > GATE.TIRED_BAND[0] && (person.activity === 'chopping' || person.activity === 'building'))
+    return 'sick of hacking at wood and stone with crude tools';
+  if (person.buildProject && person.buildProject.phase !== 'complete')
+    return 'this build is dragging — there must be a better way';
+  if (totalFood(state) < 25) return 'the village stores keep running low — food spoils too fast';
+  if ((person.skills?.farming || 0) > 10 && state.field?.planted)
+    return 'tilling the field by hand is back-breaking work';
+  return null;
+}
+
+// How observant is this person right now, as a multiplier on a node's base
+// notice chance — trait + relevant skill + need + darkness.
+function discoveryAcuity(person, node, state, needy) {
+  let m = 1;
+  if (person.traits?.includes('curious') || person.traits?.includes('observant')) m *= DISCOVERY.CURIOSITY_MULT;
+  if (person.traits?.includes('creative')) m *= DISCOVERY.CREATIVITY_MULT;
+  const skill = Math.max(...(node.noticedBy || []).map(s => person.skills?.[s] || 0), 0);
+  m *= 1 + (skill / 10) * DISCOVERY.SKILL_MULT_PER_10;
+  if (needy) m *= DISCOVERY.NEED_MULT;
+  if (state.timeOfDay === 'night') m *= DISCOVERY.NIGHT_MULT;
+  return m;
+}
+
+// Phase 1 — each tick, if this person is near an undiscovered node and the dice
+// (scaled by acuity) land, they NOTICE it: a personal discovery memory is seeded
+// and the material becomes raw fuel for ideation. Runs cheaply per agent per tick.
+function processDiscovery(person, state) {
+  if (person.sleeping || person.eating || person.lifeStage === LIFE_STAGES.BABY) return;
+  const needy = !!pressingNeed(person, state);
+  for (const node of state.resourceNodes || []) {
+    if (person.noticedResources?.[node.material]) continue; // already known to them
+    const d = Math.hypot(person.x - node.x, person.y - node.y);
+    if (d > DISCOVERY.RANGE) continue;
+    const chance = node.base * discoveryAcuity(person, node, state, needy) * (DISCOVERY.RATE_MULT || 1);
+    if (Math.random() < chance) {
+      person.noticedResources[node.material] = { near: node.near, look: node.look, day: state.day };
+      node.discoveredBy[person.name] = true; // map reveals it once anyone's seen it
+      addMemory(person, `Noticed ${node.look} near ${node.near}.`, 'discovery', state.day,
+        { location: node.near, valence: 1 });
+      person.thought = `Strange... ${node.look}.`;
+      setEmote(person, 'sparkle', 14);
+    }
+  }
+}
+
+// ── Tech graph helpers ──
+
+// Whether a tech's prerequisites are met for THIS person right now. Returns
+// { ok, missingMaterials, missingKnowledge } so the caller can turn the first
+// gap into the agent's next goal (Phase 2).
+function techPrereqsMet(person, state, tech) {
+  const missingMaterials = (tech.prereqMaterials || []).filter(mat => {
+    if ((person.inventory?.[mat] || 0) > 0) return false;
+    // a noticed-but-unmined material still counts as "known to exist"; mining
+    // it is the goal. But producible materials (charcoal, ingot) must be owned.
+    if (person.noticedResources?.[mat]) return false;
+    return true;
+  });
+  const missingKnowledge = (tech.prereqKnowledge || []).filter(k =>
+    !(person.knownTech?.[k] || state.knownTech?.[k]));
+  return { ok: missingMaterials.length === 0 && missingKnowledge.length === 0, missingMaterials, missingKnowledge };
+}
+
+// Map a free-text LLM idea onto a tech node, honoring what the person could
+// plausibly be reaching for. Returns the node or null (silent rejection).
+function matchIdeaToTech(ideaText) {
+  if (!ideaText) return null;
+  const t = ideaText.toLowerCase();
+  let best = null, bestHits = 0;
+  for (const tech of Object.values(TECH_GRAPH)) {
+    const hits = (tech.matches || []).filter(kw => t.includes(kw)).length;
+    if (hits > bestHits) { bestHits = hits; best = tech; }
+  }
+  return bestHits > 0 ? best : null;
+}
+
+// Techs this person could ATTEMPT next: prereqs met, not already known. Used to
+// nudge a matched idea toward something reachable, and to seed prototypes.
+function attemptableTech(person, state, tech) {
+  if (!tech) return false;
+  if (person.knownTech?.[tech.id]) return false;
+  return techPrereqsMet(person, state, tech).ok;
+}
+
+// Begin (or refuse) a prototype from a matched tech. If prereqs are unmet, the
+// first missing piece becomes a goal and we return a "blocked" flavor instead.
+function beginPrototype(person, state, tech) {
+  const { ok, missingMaterials, missingKnowledge } = techPrereqsMet(person, state, tech);
+  if (!ok) {
+    // turn the gap into the agent's next pursuit (Phase 2: missing piece = goal)
+    if (missingKnowledge.length) {
+      const need = TECH_GRAPH[missingKnowledge[0]];
+      person.thought = `I can't make this yet — I need to figure out ${need?.label || missingKnowledge[0]} first.`;
+    } else if (missingMaterials.length) {
+      const mat = missingMaterials[0];
+      person.thought = `I'd need ${mat} for this. Where would I even find ${mat}?`;
+      // point them at the node if it exists, so the search is real
+      const node = (state.resourceNodes || []).find(n => n.material === mat);
+      if (node) { person.targetX = node.x; person.targetY = node.y; setGoal(person, 'seek_material', mat, 120); }
+    }
+    return false;
+  }
+  person.prototype = {
+    techId: tech.id, label: tech.label, progress: 0,
+    attemptsLeft: tech.attemptsNeeded, failureChance: tech.failureChance,
+    group: !!tech.group, // a big dig/build that wants a second pair of hands (Phase 7)
+  };
+  person.activity = 'experimenting';
+  setGoal(person, 'prototype', tech.label, 300);
+  if (tech.group) {
+    person.thought = `This is too much for one person — I should get someone to help dig.`;
+    // recruit: seek the friendliest available adult to lend a hand
+    const helper = recruitHelper(person, state);
+    if (helper) goToPerson(person, helper); // walk to them; proximity drives the group bonus
+  } else {
+    person.thought = `Going to try something with the ${(tech.prereqMaterials || []).join(' and ')}...`;
+  }
+  setEmote(person, 'sparkle', 16);
+  return true;
+}
+
+// Phase 7 — find a nearby-ish willing adult to help on a group project. Prefers
+// a friend/partner; returns null if nobody suitable.
+function recruitHelper(person, state) {
+  let best = null, bestScore = 20;
+  for (const o of state.people) {
+    if (o === person || o.alive === false || o.lifeStage === LIFE_STAGES.BABY || o.lifeStage === LIFE_STAGES.CHILD) continue;
+    if (o.prototype || o.buildProject) continue; // already busy inventing/building
+    const rel = person.relationships?.[o.name];
+    const score = (rel?.affection || 0) + (person.partner === o.name ? 40 : 0);
+    if (score > bestScore) { bestScore = score; best = o; }
+  }
+  return best;
+}
+
+// Phase 4 — advance an in-progress prototype one tick. Fills a progress bar;
+// each completed bar is one ATTEMPT that may fail (consuming material, teaching
+// a little) or succeed (breakthrough). Failure is productive.
+function processPrototype(person, state) {
+  const proto = person.prototype;
+  if (!proto) return;
+  const tech = TECH_GRAPH[proto.techId];
+  if (!tech) { person.prototype = null; return; }
+  person.activity = 'experimenting';
+
+  const skill = Math.max(person.skills?.crafting || 0, person.skills?.building || 0);
+  const toolMult = person.tools?.copper_axe || person.tools?.flint_knife ? 1.3 : 1;
+  // Phase 7: a group project (e.g. irrigation ditch) crawls alone and speeds up
+  // with a willing pair of hands nearby. Check for a helper within reach.
+  let groupMult = 1;
+  if (proto.group) {
+    const helper = state.people.find(o => o !== person && o.alive !== false &&
+      o.lifeStage !== LIFE_STAGES.BABY && o.lifeStage !== LIFE_STAGES.CHILD &&
+      distBetween(person, o) <= 3);
+    if (helper) {
+      groupMult = 2.2;
+      if (Math.random() < 0.01) {
+        helper.thought = `Helping ${person.name} dig.`;
+        const hr = helper.relationships?.[person.name];
+        if (hr) hr.affection = clamp(hr.affection + 0.5, 0, 100);
+      }
+    } else {
+      groupMult = 0.25; // barely makes headway solo — they really need help
+      if (Math.random() < 0.02) person.thought = `I can't do this alone — I need help.`;
+    }
+  }
+  proto.progress += (PROTOTYPE.PROGRESS_PER_TICK + (skill / 10) * PROTOTYPE.SKILL_PROGRESS_PER_10) * toolMult * groupMult;
+  if (proto.progress < 1) {
+    if (Math.random() < 0.03) person.thought = `Fiddling with the ${(tech.prereqMaterials || [])[0] || 'materials'}...`;
+    return;
+  }
+  // one full attempt resolved
+  proto.progress = 0;
+  proto.attemptsLeft = Math.max(0, proto.attemptsLeft - 1);
+  const effFail = Math.max(0.05, proto.failureChance - (skill / 100));
+  // once the planned attempts are used up, a try lands with prob (1 - effFail);
+  // before then, a lucky early breakthrough is possible but rare (~15%).
+  const succeed = proto.attemptsLeft <= 0 ? (Math.random() > effFail) : (Math.random() > 0.85);
+
+  if (!succeed) {
+    // productive failure: burn a material, learn a little, leave a memory
+    const mat = (tech.prereqMaterials || []).find(m => (person.inventory?.[m] || 0) > 0);
+    if (mat) person.inventory[mat] = Math.max(0, person.inventory[mat] - PROTOTYPE.MATERIAL_COST_ON_FAIL);
+    proto.failureChance = Math.max(0.05, proto.failureChance - PROTOTYPE.FAIL_LEARN_BONUS);
+    if (proto.attemptsLeft <= 0) proto.attemptsLeft = 1; // not ready to land yet — keep trying
+    const flavor = failureFlavor(tech);
+    addMemory(person, flavor, 'experiment', state.day, { location: person.currentLocation, valence: -0.3 });
+    person.thought = flavor;
+    gainSkill(person, 'crafting', 0.1);
+    setEmote(person, 'sweat', 10);
+    rewardAction(person, 'invent', -0.5, state); // small sting, but they keep going
+    return;
+  }
+  techBreakthrough(person, state, tech);
+}
+
+function failureFlavor(tech) {
+  switch (tech.id) {
+    case 'copper_smelting': return 'Tried to melt the green rocks — nothing happened. Maybe the fire wasn\'t hot enough?';
+    case 'clay_pottery': return 'The clay bowl cracked apart in the fire. Too fast, maybe.';
+    case 'charcoal': return 'The wood just burned to ash, not the black stuff. I covered it wrong.';
+    case 'fire_knowledge': return 'Couldn\'t get the fire to catch the way I wanted. Frustrating.';
+    default: return `Tried to make ${tech.label.toLowerCase()} — it didn't work. Something's missing.`;
+  }
+}
+
+// Phase 4/5 — a breakthrough. Permanent personal + village knowledge, big Q
+// reward, reputation, role formalization, emote, chronicle entry.
+function techBreakthrough(person, state, tech) {
+  person.prototype = null;
+  person.knownTech[tech.id] = true;
+  if (!state.knownTech[tech.id]) {
+    state.knownTech[tech.id] = { by: person.name, day: state.day };
+    state.inventions.push({ techId: tech.id, label: tech.label, by: person.name, day: state.day });
+    state.events.push({ day: state.day, hour: state.hour, participants: [person.name],
+      summary: `💡 ${person.name} invented ${tech.label}!`, type: 'invention' });
+  }
+  // apply the payoff
+  applyTechEffect(person, state, tech);
+  // formalize a role (Phase 7)
+  if (tech.role && !person.techRole) {
+    person.techRole = tech.role;
+    addMemory(person, `Became the village's ${tech.role}.`, 'achievement', state.day, { valence: 2 });
+  }
+  addMemory(person, `Figured out how to make ${tech.label}! A real breakthrough.`, 'achievement', state.day,
+    { location: person.currentLocation, valence: 2.5 });
+  person.thought = `I did it — ${tech.label}!`;
+  person.mood = 'excited';
+  setEmote(person, 'sparkle', 40);
+  bumpReputation(state, person.name, 'skilled', PROTOTYPE.REP_BREAKTHROUGH);
+  rewardAction(person, 'invent', PROTOTYPE.REWARD_BREAKTHROUGH, state);
+  gainSkill(person, 'crafting', 2);
+  person.activity = 'idle';
+}
+
+// Translate a tech's `effect` into actual sim mechanics for this person/village.
+function applyTechEffect(person, state, tech) {
+  const e = tech.effect || {};
+  switch (e.type) {
+    case 'tool':
+      person.tools = { ...(person.tools || {}), [e.tool]: true };
+      break;
+    case 'material':
+      // smelting/charcoal turns a raw material into a worked one on success
+      person.inventory[e.material] = (person.inventory[e.material] || 0) + 2;
+      break;
+    case 'storage':
+      // pottery/drying/smokehouse cut village food spoilage — tracked on state
+      state.spoilageMult = Math.min(state.spoilageMult ?? 1, 1 - (e.food || 0));
+      break;
+    case 'farmYield':
+      // plow/irrigation boost field yields — read by the harvest path
+      state.farmYieldMult = Math.max(state.farmYieldMult ?? 1, e.mult || 1);
+      break;
+    default:
+      break; // 'enable' (fire_knowledge) is its own reward: unlocks downstream
+  }
+}
+
+// Phase 5 — learning by observation. If this person SEES someone with a tech
+// they lack actively using it (experimenting / smithing nearby), they may pick
+// up the idea and attempt to replicate it. Cheap, vision-gated, rare.
+function processTechObservation(person, state) {
+  if (person.sleeping || person.eating || person.prototype) return;
+  if (Math.random() > 0.02) return; // observation is occasional, not constant
+  const seen = perceive(person, state).people;
+  for (const other of seen) {
+    const theirTech = other.knownTech ? Object.keys(other.knownTech) : [];
+    for (const techId of theirTech) {
+      if (person.knownTech?.[techId]) continue;
+      const tech = TECH_GRAPH[techId];
+      if (!tech || !attemptableTech(person, state, tech)) continue;
+      // only "click" if they're plausibly demonstrating it (working/experimenting)
+      if (!['experimenting', 'crafting', 'building', 'farming'].includes(other.activity)) continue;
+      addMemory(person, `Watched ${other.name} make ${tech.label} — I think I see how.`, 'discovery', state.day,
+        { location: person.currentLocation, valence: 1 });
+      person.thought = `So that's how ${other.name} does it...`;
+      beginPrototype(person, state, tech);
+      return;
+    }
+  }
+}
+
+// Phase 3 — the ideation escalation. When a needy, curious person who's noticed
+// raw materials gets a chance, fire a constrained LLM call asking what they
+// might try making. The system maps the idea onto the graph and prototypes it.
+export async function runIdeation(gameRef, personIdx, signal) {
+  const person = gameRef.current.people[personIdx];
+  person.pendingIdea = false;
+  const rate = DISCOVERY.RATE_MULT || 1;
+  person.ideaCooldown = Math.round((IDEA.COOLDOWN_MIN + Math.floor(Math.random() * IDEA.COOLDOWN_SPAN)) / rate);
+  if (person.prototype || person.sleeping || person.eating) return;
+  const cs = gameRef.current;
+  const need = pressingNeed(person, cs) || 'a nagging sense there must be a better way';
+  const noticed = Object.values(person.noticedResources || {})
+    .map(info => `${info.look} (near ${info.near})`);
+  if (!noticed.length) return; // nothing to ideate from
+  const knownTechniques = Object.keys(person.knownTech || {})
+    .map(id => TECH_GRAPH[id]?.label).filter(Boolean);
+  const result = await generateIdeation(person, { need, noticed, knownTechniques }, signal);
+  recordModelResult(cs, person.model, !!result);
+  if (!result || !result.idea) return;
+  person.thought = result.idea;
+  const tech = matchIdeaToTech(result.idea + ' ' + (result.making || ''));
+  if (!tech) {
+    // silent rejection — they "can't quite figure it out" but it stews
+    addMemory(person, `Had an odd idea but couldn't make it work yet.`, 'experiment', cs.day, { valence: -0.2 });
+    person.thought = result.idea + ' ...but I can\'t make it work.';
+    return;
+  }
+  beginPrototype(person, cs, tech);
+}
+
 function updateSkills(person, state) {
   const loc = person.currentLocation;
   const tools = person.tools || {};
@@ -1845,8 +2409,9 @@ function updateSkills(person, state) {
       person.thought = winter ? 'Sowing now, in winter? Nothing will grow...' : 'Sowed the field. Now to wait for it to grow.';
       setEmote(person, 'sparkle', 6);
     } else if (f.stage >= FARM.RIPE) {
-      // harvest! big typed-crop yield scaled by farming skill
-      const yield_ = Math.round(FARM.BASE_YIELD + person.skills.farming * FARM.SKILL_YIELD);
+      // harvest! big typed-crop yield scaled by farming skill, boosted by any
+      // farming tech the village has invented (plow / irrigation — Phase 4).
+      const yield_ = Math.round((FARM.BASE_YIELD + person.skills.farming * FARM.SKILL_YIELD) * (state.farmYieldMult ?? 1));
       addFood(person, 'crops', yield_);
       person.foodGathered += yield_;
       gainSkill(person, 'farming', 1);
@@ -1904,11 +2469,30 @@ function updateSkills(person, state) {
     }
   }
 
+  // mining a noticed raw material (Phase 1→2). When seeking a material they've
+  // spotted, standing on/near its node yields it so prototyping can proceed.
+  if ((person.activity === 'mining' || person.currentGoal?.type === 'seek_material')) {
+    const want = person.currentGoal?.target;
+    const node = (state.resourceNodes || []).find(n =>
+      n.material === want && person.noticedResources?.[n.material] &&
+      Math.hypot(person.x - n.x, person.y - n.y) <= DISCOVERY.RANGE);
+    if (node) {
+      person.activity = 'mining';
+      if (Math.random() < 0.02 + (person.skills.building || 0) * 0.0004) {
+        person.inventory[want] = (person.inventory[want] || 0) + 1;
+        gainSkill(person, 'building', 0.08);
+        person.thought = `Gathered some ${want}. (${person.inventory[want]} total)`;
+        setEmote(person, 'sparkle', 6);
+        if ((person.inventory[want] || 0) >= 2) person.currentGoal = null; // enough to try with
+      }
+    }
+  }
+
   // storytelling is now a modest, completion-based skill (handled at end of a
   // conversation in runConversation), NOT a free +0.06/tick ride. Here we only
   // keep the subtle attraction effect for already-skilled storytellers.
   if (person.conversationId && person.skills.storytelling > 30) {
-    for (const [name, rel] of Object.entries(person.relationships)) {
+    for (const rel of Object.values(person.relationships)) {
       if (rel.familiarity > 10 && Math.random() < 0.005) {
         rel.attraction = Math.min(100, rel.attraction + 0.3);
       }
@@ -1935,22 +2519,33 @@ function childLearnFromParent(child, parent) {
 // lingers near a clear expert, the novice drifts upward in that skill — a slow,
 // ambient apprenticeship. Occasionally it sparks an explicit teaching exchange
 // (flagged here, run as an LLM beat by the conversation system).
-function processAdultTeaching(person, people) {
+function processAdultTeaching(person, people, state) {
   if (person.alive === false || person.sleeping || person.conversationId) return;
   if (person.lifeStage === LIFE_STAGES.BABY || person.lifeStage === LIFE_STAGES.CHILD) return;
   const mySkill = topSkill(person);
-  if (!mySkill || (person.skills[mySkill] || 0) < 25) return; // must be a real expert
+  const myTech = Object.keys(person.knownTech || {});
+  if ((!mySkill || (person.skills[mySkill] || 0) < 25) && !myTech.length) return; // expert in skill OR tech
   for (const other of people) {
     if (other === person || other.alive === false || other.sleeping) continue;
     if (other.lifeStage === LIFE_STAGES.BABY) continue;
     if (distBetween(person, other) > 3) continue;
-    const gap = (person.skills[mySkill] || 0) - (other.skills[mySkill] || 0);
-    if (gap < 15) continue; // only worth teaching a clear novice
-    // ambient drift — the novice picks a little up just by being around mastery
-    other.skills[mySkill] = Math.min(100, (other.skills[mySkill] || 0) + 0.02);
-    // occasionally escalate to an explicit lesson (handled as a conversation beat)
-    if (!person._pendingTeach && person.conversationCooldown <= 0 && Math.random() < 0.0008) {
-      person._pendingTeach = { student: other.name, skill: mySkill };
+    // ── Phase 5: teach a RECIPE the novice lacks but could do (oral tradition) ──
+    if (state && !person._pendingTechTeach && person.conversationCooldown <= 0) {
+      const teachable = myTech.find(t => !other.knownTech?.[t] && attemptableTech(other, state, TECH_GRAPH[t]));
+      if (teachable && Math.random() < 0.004) {
+        person._pendingTechTeach = { student: other.name, techId: teachable };
+        continue;
+      }
+    }
+    if (mySkill && (person.skills[mySkill] || 0) >= 25) {
+      const gap = (person.skills[mySkill] || 0) - (other.skills[mySkill] || 0);
+      if (gap < 15) continue; // only worth teaching a clear novice
+      // ambient drift — the novice picks a little up just by being around mastery
+      other.skills[mySkill] = Math.min(100, (other.skills[mySkill] || 0) + 0.02);
+      // occasionally escalate to an explicit lesson (handled as a conversation beat)
+      if (!person._pendingTeach && person.conversationCooldown <= 0 && Math.random() < 0.0008) {
+        person._pendingTeach = { student: other.name, skill: mySkill };
+      }
     }
   }
 }
@@ -2088,7 +2683,10 @@ function processResources(state, dayRolled) {
   // spoilage: a fraction of each food type rots per game-day (a smokehouse can
   // slow this later via System 4)
   if (dayRolled) {
-    const slow = (state.buildings || []).some(b => /smokehouse|storage|drying/i.test(b.type || '')) ? 0.5 : 1;
+    const buildingSlow = (state.buildings || []).some(b => /smokehouse|storage|drying/i.test(b.type || '')) ? 0.5 : 1;
+    // invented preservation tech (pottery/drying rack/smokehouse) compounds with
+    // any storage building, via the spoilageMult set in applyTechEffect.
+    const slow = buildingSlow * (state.spoilageMult ?? 1);
     for (const t of Object.keys(FOOD_TYPES)) {
       const rot = Math.floor((state.larder[t] || 0) * FOOD_TYPES[t].spoilPerDay * slow);
       if (rot > 0) state.larder[t] = Math.max(0, state.larder[t] - rot);
@@ -2260,6 +2858,79 @@ function killPerson(person, state, cause) {
     }
   }
   state.events.push({ day: state.day, hour: state.hour, participants: [person.name], summary: `${person.name} passed away from ${cause}.`, type: 'death' });
+
+  // ── Oral tradition (Phase 5) ── knowledge dies with its keeper unless someone
+  // still living also knows it. A breakthrough that was never taught is LOST —
+  // the village forgets how, and someone may have to rediscover it later.
+  for (const techId of Object.keys(person.knownTech || {})) {
+    const stillKnown = alivePeople.some(p => p.knownTech?.[techId]);
+    if (!stillKnown && state.knownTech[techId]) {
+      delete state.knownTech[techId];
+      const tech = TECH_GRAPH[techId];
+      state.events.push({ day: state.day, hour: state.hour, participants: [person.name],
+        summary: `📜 The secret of ${tech?.label || techId} died with ${person.name}.`, type: 'knowledge_lost' });
+      // drop the village-wide tech effect that depended on it
+      recomputeTechEffects(state);
+    }
+  }
+}
+
+// Smite via the proper death pipeline so the World panel, stats, oral-tradition
+// knowledge loss, grief and the death event all fire (raw alive=false skipped
+// all of that). Called by the Smite god power.
+export function divineKill(state, targetIdx, cause = 'divine wrath') {
+  const target = state.people[targetIdx];
+  if (!target || target.alive === false || target.isAvatar) return;
+  killPerson(target, state, cause);
+}
+
+// Resurrection — bring a dead villager back. Restores life, clears the death
+// state, gives them a full bar of health, and leaves everyone (and the revived)
+// a heavy, lasting memory. The village's awe surges. Returns nothing; mutates.
+export function resurrect(state, targetIdx) {
+  const target = state.people[targetIdx];
+  if (!target || target.alive !== false || target.isAvatar) return;
+  target.alive = true;
+  target.activity = 'idle';
+  target.health = 100;
+  target.hunger = 20; target.tiredness = 10; target.loneliness = 30;
+  target.injury = 0; target.sick = false; target.sickTimer = 0;
+  target.frailty = Math.min(target.frailty || 0, 20); // come back a little frail, not aged out
+  target.sleeping = false; target.eating = false;
+  target.mood = 'excited';
+  setEmote(target, 'sparkle', 60);
+  addMemory(target, 'I was dead — and the gods called me back.', 'achievement', state.day, { valence: 3 });
+  target.thought = 'I... I was gone. And now I am here again.';
+  state.stats.totalDeaths = Math.max(0, (state.stats.totalDeaths || 0) - 1);
+  state.events.push({ day: state.day, hour: state.hour, participants: [target.name],
+    summary: `🌟 The gods raised ${target.name} from death!`, type: 'god' });
+  for (const p of state.people) {
+    if (p.isAvatar || p.alive === false || p.name === target.name) continue;
+    p.awe = Math.min(100, (p.awe || 0) + 40);
+    addMemory(p, `Witnessed ${target.name} brought back from death — the gods are real.`, 'god', state.day, { valence: 3 });
+    if (p.mood === 'sad' || p.mood === 'heartbroken') p.mood = 'excited';
+    setEmote(p, 'sparkle', 40);
+    // mend partner/loved bonds that the death severed
+    if (target.relationships?.[p.name]) {
+      const r = p.relationships[target.name] || (p.relationships[target.name] = blankRel('friend'));
+      r.affection = clamp((r.affection || 50) + 10, 0, 100);
+      r.trust = clamp((r.trust || 50) + 10, 0, 100);
+    }
+  }
+}
+
+// Recompute village-wide tech multipliers from whatever knowledge survives, so a
+// lost invention actually rolls back its benefit (Phase 5 stakes).
+function recomputeTechEffects(state) {
+  state.spoilageMult = 1;
+  state.farmYieldMult = 1;
+  for (const techId of Object.keys(state.knownTech || {})) {
+    const tech = TECH_GRAPH[techId];
+    if (!tech) continue;
+    const e = tech.effect || {};
+    if (e.type === 'storage') state.spoilageMult = Math.min(state.spoilageMult, 1 - (e.food || 0));
+    if (e.type === 'farmYield') state.farmYieldMult = Math.max(state.farmYieldMult, e.mult || 1);
+  }
 }
 
 // ── Breakups ──
@@ -2354,11 +3025,308 @@ function processSeasonalEvents(state) {
   // (handled in relationship stage updates)
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// GOD AVATAR — the deity walks among the villagers
+//
+// A special person the human drives directly (WASD movement, typed dialogue).
+// It lives in state.people so it renders and is perceived/talked-to like anyone,
+// but `isAvatar` excludes it from all autonomous simulation. It can appear as a
+// mysterious stranger (villagers treat it as a normal newcomer) or as an obvious
+// deity (its words carry awe and reputation weight).
+// ════════════════════════════════════════════════════════════════════════════
+
+const AVATAR_ID = 999999;
+
+// Create and place the avatar near the campfire. `divine` chooses how villagers
+// perceive it. Returns the new state (avatar appended to people).
+export function spawnAvatar(state, { divine = false, name } = {}) {
+  if (state.people.some(p => p.isAvatar)) return state; // only one at a time
+  const cf = LOCATIONS.CAMPFIRE;
+  const avatar = {
+    id: AVATAR_ID,
+    isAvatar: true,
+    divine,
+    name: name || (divine ? 'The Presence' : 'Wanderer'),
+    gender: 'other',
+    age: 0,
+    lifeStage: LIFE_STAGES.ADULT,
+    color: divine ? 0xffe066 : 0xcccccc,
+    traits: [], values: [],
+    x: cf.x, y: cf.y,
+    targetX: null, targetY: null,
+    currentLocation: 'Campfire',
+    mood: divine ? 'loving' : 'neutral',
+    activity: 'idle',
+    alive: true,
+    sleeping: false, eating: false, sick: false,
+    conversationId: null, conversationCooldown: 0,
+    relationships: {}, reputationBeliefs: {},
+    memories: [], conversationLog: [],
+    skills: {}, inventory: {}, larder: {},
+    hunger: 0, tiredness: 0, loneliness: 0,
+    injury: 0, frailty: 0, awe: 0,
+    emote: null, emoteTimer: 0,
+    partner: null, home: null, children: [], parents: [],
+    // a model so the avatar could (later) speak autonomously; harmless if unused
+    model: pickModelWeighted(state.modelStats),
+    speechStyle: divine ? 'Speaks with calm, weighty certainty.' : 'Speaks plainly, like a traveler.',
+  };
+  // seed a fresh stranger relationship both ways so rapport can actually build
+  // across visits (villagers start knowing nothing about this newcomer).
+  for (const v of state.people) {
+    if (v.isAvatar) continue;
+    avatar.relationships[v.name] = blankRel('stranger');
+    v.relationships[avatar.name] = blankRel('stranger');
+  }
+  return { ...state, people: [...state.people, avatar], avatarId: AVATAR_ID };
+}
+
+// A neutral relationship record (mirrors initRelationships' shape).
+function blankRel(stage = 'stranger') {
+  return { affection: 45, trust: 45, attraction: 0, familiarity: 0, stage, jealousy: 0 };
+}
+
+export function despawnAvatar(state) {
+  const avatar = getAvatar(state);
+  if (!avatar) return state;
+  // Villagers NOTICE the stranger/presence vanish. Anyone who was near reacts:
+  // a normal stranger leaving is mildly notable; a divine presence vanishing is
+  // eerie and memorable. This also releases anyone still flagged in the convo.
+  const convo = state.activeConversations.find(c => c.avatar);
+  const knewThem = new Set(convo?.participants || []);
+  for (const p of state.people) {
+    if (p.isAvatar) continue;
+    if (p.conversationId === convo?.id) p.conversationId = null; // release from avatar chat
+    const wasNear = distBetween(p, avatar) < 7;
+    if (!wasNear && !knewThem.has(p.name)) continue;
+    if (avatar.divine) {
+      addMemory(p, `The presence vanished as suddenly as it came. Where did it go?`, 'god', state.day,
+        { location: p.currentLocation, valence: 1 });
+      p.awe = Math.min(100, (p.awe || 0) + 8);
+      p.mood = 'thoughtful';
+      setEmote(p, 'sparkle', 20);
+    } else {
+      addMemory(p, `That stranger, ${avatar.name}, is gone. Didn't even say goodbye.`, 'life', state.day,
+        { location: p.currentLocation, valence: 0.2 });
+      setEmote(p, 'thought', 16);
+    }
+    p.thought = avatar.divine ? 'The presence... it left. I felt it.' : `Where did ${avatar.name} go?`;
+  }
+  return {
+    ...state,
+    people: state.people.filter(p => !p.isAvatar),
+    activeConversations: state.activeConversations.filter(c => !c.avatar),
+    avatarId: null,
+  };
+}
+
+export function getAvatar(state) {
+  return state.people.find(p => p.isAvatar) || null;
+}
+
+// Move the avatar by a tile-space delta (called from the keyboard loop). Clamps
+// to the map and routes around water using the same walkable check as villagers.
+export function moveAvatar(state, dx, dy) {
+  const a = getAvatar(state);
+  if (!a) return state;
+  const nx = clamp(a.x + dx, 0, MAP_W - 1);
+  const ny = clamp(a.y + dy, 0, MAP_H - 1);
+  // don't walk into water (gods can, but it looks odd); allow if no better option
+  if (state.terrain?.[Math.round(ny)]?.[Math.round(nx)]?.type !== TERRAIN.WATER) {
+    a.x = nx; a.y = ny;
+  } else {
+    // allow axis-only slide so movement doesn't feel stuck against the shore
+    if (state.terrain?.[Math.round(a.y)]?.[Math.round(nx)]?.type !== TERRAIN.WATER) a.x = nx;
+    else if (state.terrain?.[Math.round(ny)]?.[Math.round(a.x)]?.type !== TERRAIN.WATER) a.y = ny;
+  }
+  a.currentLocation = locationAt(a.x, a.y);
+  return state;
+}
+
+// A human-authored avatar line → nearby villagers hear it and reply via their own
+// LLMs. The avatar's words land as memories and (optionally, when divine) shift
+// mood/awe/reputation. Drives one round: avatar speaks, then each nearby villager
+// who chooses to responds. Returns updated state via onUpdate, like runConversation.
+export async function avatarSpeak(gameRef, text, onUpdate, signal) {
+  const cs = gameRef.current;
+  const avatar = getAvatar(cs);
+  if (!avatar || !text?.trim()) return;
+
+  // who's close enough to hear (a bit generous on the larger map so you don't
+  // have to stand on top of someone)
+  const HEAR_RANGE = 7;
+  const listeners = cs.people.filter(p =>
+    !p.isAvatar && p.alive !== false && p.lifeStage !== LIFE_STAGES.BABY &&
+    distBetween(avatar, p) < HEAR_RANGE && !p.sleeping);
+
+  // nobody in earshot — give clear feedback instead of silently doing nothing
+  // (a common confusion on the big map: the avatar speaks to empty air).
+  if (listeners.length === 0) {
+    let convo0 = cs.activeConversations.find(c => c.avatar);
+    if (!convo0) {
+      const cid = cs.nextConvoId;
+      gameRef.current = { ...cs, nextConvoId: cid + 1 };
+      convo0 = { id: cid, participants: [avatar.name], lines: [], location: avatar.currentLocation, startTick: cs.tick, active: true, avatar: true };
+      gameRef.current = { ...gameRef.current, activeConversations: [...gameRef.current.activeConversations, convo0] };
+    }
+    convo0.lines.push({ speaker: avatar.name, text: text.trim(), thought: null, mood: avatar.mood, addressedTo: 'everyone' });
+    convo0.lines.push({ speaker: 'narrator', text: 'No one is close enough to hear. Walk nearer to a villager (WASD).', thought: null, mood: null });
+    setEmote(avatar, 'sparkle', 10);
+    pushAvatarConvo(gameRef, convo0);
+    onUpdate?.();
+    return;
+  }
+
+  // find or open a conversation anchored on the avatar
+  let convo = cs.activeConversations.find(c => c.participants.includes(avatar.name));
+  if (!convo) {
+    const convoId = cs.nextConvoId;
+    gameRef.current = { ...cs, nextConvoId: convoId + 1 };
+    convo = {
+      id: convoId,
+      participants: [avatar.name, ...listeners.map(p => p.name)],
+      lines: [], location: avatar.currentLocation, startTick: cs.tick, active: true, avatar: true,
+    };
+    gameRef.current = { ...gameRef.current, activeConversations: [...gameRef.current.activeConversations, convo] };
+  } else {
+    // refresh the listener roster as the avatar moves around
+    for (const l of listeners) if (!convo.participants.includes(l.name)) convo.participants.push(l.name);
+  }
+
+  // record the avatar's spoken line
+  convo.lines.push({ speaker: avatar.name, text: text.trim(), thought: null, mood: avatar.mood, addressedTo: 'everyone' });
+  setEmote(avatar, 'sparkle', 12);
+
+  // the divine word leaves a mark on everyone who heard it, and we LOCK them into
+  // the avatar conversation (conversationId) so the autonomous loop can't grab
+  // them mid-reply — this was the race that trampled their state.
+  for (const l of listeners) {
+    l.conversationId = convo.id;
+    addMemory(l, `${avatar.divine ? 'A divine voice' : avatar.name} said: "${text.trim().slice(0, 80)}"`,
+      avatar.divine ? 'god' : 'conversation', cs.day, { location: avatar.currentLocation, valence: avatar.divine ? 1.5 : 0.3 });
+    if (avatar.divine) { l.awe = Math.min(100, (l.awe || 0) + 12); }
+  }
+  pushAvatarConvo(gameRef, convo);
+  onUpdate?.();
+
+  // each listener gets a chance to reply (in proximity order), via their own model.
+  // Wrapped in try/finally so a thrown error mid-reply (e.g. a malformed AI result
+  // being dereferenced) can never leave listeners locked with conversationId set —
+  // which would silently exclude them from all future ticks forever.
+  const history = convo.lines.map(li => ({ speaker: li.speaker, text: li.text }));
+  try {
+    for (const listener of listeners.sort((a, b) => distBetween(avatar, a) - distBetween(avatar, b)).slice(0, 3)) {
+      if (signal?.aborted) break;
+      // the player may have despawned the avatar mid-loop — stop cleanly if so
+      if (!getAvatar(gameRef.current)) break;
+      const others = [avatar, ...listeners.filter(p => p !== listener)];
+      // generateGroupDialogue appends the reply to `history` itself, so we pass it
+      // through and DON'T push again (that caused duplicate lines in the prompt).
+      const result = await generateAvatarReply(listener, avatar, others, cs, history, signal);
+      if (!result || !result.dialogue?.trim()) continue;
+      convo.lines.push({ speaker: listener.name, text: result.dialogue.trim(), thought: result.internal_thought, mood: result.mood_after, addressedTo: avatar.name });
+      listener.mood = result.mood_after || listener.mood;
+      listener.thought = result.internal_thought || listener.thought;
+      // talking with the avatar actually builds a relationship now (rapport across
+      // visits). Apply the LLM's deltas to the listener→avatar relationship.
+      applyAvatarRelationship(listener, avatar, result);
+      pushAvatarConvo(gameRef, convo);
+      onUpdate?.();
+    }
+  } finally {
+    // release listeners back to normal life once the exchange settles, with a short
+    // cooldown so they don't immediately get yanked into an autonomous chat.
+    for (const l of listeners) {
+      if (l.conversationId === convo.id) { l.conversationId = null; l.conversationCooldown = 8 + Math.floor(Math.random() * 6); }
+    }
+  }
+}
+
+// Apply the LLM's relationship deltas from an avatar reply to the listener's
+// view of the avatar (the entry is seeded in spawnAvatar, so it always exists).
+function applyAvatarRelationship(listener, avatar, result) {
+  const rel = listener.relationships[avatar.name];
+  if (!rel) return;
+  const changes = result.relationship_changes?.[avatar.name] || {};
+  rel.affection = clamp(rel.affection + (changes.affection || 0), 0, 100);
+  rel.trust = clamp(rel.trust + (changes.trust || 0), 0, 100);
+  rel.attraction = clamp(rel.attraction + (changes.attraction || 0), 0, 100);
+  rel.familiarity = clamp(rel.familiarity + 3, 0, 100); // meeting them builds familiarity
+  if (rel.familiarity > 20 && rel.stage === 'stranger') rel.stage = 'acquaintance';
+}
+
+// PROVE IT — a visible miracle performed BY the avatar, for the villagers who
+// demand proof that this stranger is what they claim. Unlike the global god
+// powers, this is localized and ATTRIBUTED to the avatar by name, so witnesses
+// connect the wonder to the figure standing in front of them and start to
+// believe. Heals, feeds, and floods nearby villagers with awe + a heavy memory.
+// Returns the count of witnesses (so the UI can react).
+export function performAvatarMiracle(gameRef) {
+  const cs = gameRef.current;
+  const avatar = getAvatar(cs);
+  if (!avatar) return 0;
+  const RANGE = 8;
+  const witnesses = cs.people.filter(p =>
+    !p.isAvatar && p.alive !== false && distBetween(avatar, p) < RANGE);
+
+  // a light-burst particle cue on the avatar itself
+  setEmote(avatar, 'sparkle', 60);
+
+  let convo = cs.activeConversations.find(c => c.avatar);
+  if (!convo) {
+    const cid = cs.nextConvoId;
+    gameRef.current = { ...cs, nextConvoId: cid + 1 };
+    convo = { id: cid, participants: [avatar.name], lines: [], location: avatar.currentLocation, startTick: cs.tick, active: true, avatar: true };
+    gameRef.current = { ...gameRef.current, activeConversations: [...gameRef.current.activeConversations, convo] };
+  }
+  convo.lines.push({ speaker: 'narrator', text: `${avatar.name} raises a hand — light pours out. Wounds close, hunger fades, the air hums.`, thought: null, mood: null });
+
+  for (const p of witnesses) {
+    // the wonder itself: full relief + healing, the kind no mortal could do
+    p.hunger = 0;
+    p.tiredness = Math.max(0, p.tiredness - 40);
+    p.health = 100;
+    p.injury = 0;
+    p.sick = false; p.sickTimer = 0;
+    p.awe = Math.min(100, (p.awe || 0) + 55);
+    p.mood = 'excited';
+    setEmote(p, 'sparkle', 50);
+    // a heavy, lasting memory tied to THIS figure — the seed of belief
+    addMemory(p, `Saw ${avatar.name} work a miracle before my eyes — light, healing, no trick. They are no ordinary stranger.`,
+      'god', cs.day, { location: avatar.currentLocation, valence: 3 });
+    // their trust in the avatar leaps (belief)
+    const rel = p.relationships[avatar.name] || (p.relationships[avatar.name] = blankRel('acquaintance'));
+    rel.trust = clamp(rel.trust + 30, 0, 100);
+    rel.affection = clamp(rel.affection + 15, 0, 100);
+    rel.familiarity = clamp(rel.familiarity + 10, 0, 100);
+    p.thought = `It's real. ${avatar.name} is real.`;
+  }
+  cs.events.push({ day: cs.day, hour: cs.hour, participants: [avatar.name, ...witnesses.map(w => w.name)],
+    summary: `🌟 ${avatar.name} performed a miracle before ${witnesses.length} witness${witnesses.length === 1 ? '' : 'es'}!`, type: 'god' });
+  const list = gameRef.current.activeConversations.map(c => c.id === convo.id ? { ...convo, lines: [...convo.lines] } : c);
+  gameRef.current = { ...gameRef.current, activeConversations: list };
+  return witnesses.length;
+}
+
+// End the avatar conversation, releasing listeners (called on despawn or "leave").
+export function endAvatarConversation(state) {
+  const convo = state.activeConversations.find(c => c.avatar);
+  if (!convo) return state;
+  convo.active = false;
+  return { ...state, activeConversations: state.activeConversations.filter(c => !c.avatar) };
+}
+
+function pushAvatarConvo(gameRef, convo) {
+  const list = gameRef.current.activeConversations.map(c =>
+    c.id === convo.id ? { ...convo, lines: [...convo.lines], participants: [...convo.participants] } : c);
+  gameRef.current = { ...gameRef.current, activeConversations: list };
+}
+
 // ── Conversations ──
 
 export function findConversationGroup(people) {
   const available = people.filter(p =>
-    p.alive !== false && !p.conversationId && p.conversationCooldown <= 0 &&
+    p.alive !== false && !p.isAvatar && !p.conversationId && p.conversationCooldown <= 0 &&
     !p.sleeping && !p.eating && p.lifeStage !== LIFE_STAGES.BABY &&
     // a starving or exhausted person has no business chatting — survival first
     p.hunger <= GATE.STARVING && p.tiredness <= GATE.EXHAUSTED
@@ -2408,6 +3376,12 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
   gameRef.current = { ...gameRef.current, activeConversations: [...gameRef.current.activeConversations, conversation] };
   onUpdate();
 
+  // Everything below locks participants into the conversation. Wrap it so that if
+  // anything throws (a malformed AI reply being dereferenced, etc.) we ALWAYS
+  // release them — otherwise they'd keep conversationId set forever and silently
+  // drop out of all future ticks (the only permanent-lock bug from AI failure).
+  try {
+
   // target lines = 2-4 per person. We count PRODUCED lines, not attempts, so a
   // flaky model failing a turn doesn't silently burn the whole conversation.
   const targetLines = participants.length * (2 + Math.floor(Math.random() * 3));
@@ -2431,6 +3405,11 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
     // present = still in the convo AND not hopelessly failing (3+ misses)
     const present = participants.filter(p => p.conversationId === convoId && p.alive !== false && failCount.get(p.name) < 3);
     if (present.length < 2) break;
+    // Early bail: if nothing has landed yet and everyone present is already
+    // failing, the AI layer is down (e.g. all models 404ing). Don't grind through
+    // maxAttempts × 500ms sleeps locking these villagers in a silent stall —
+    // give up now and let the cleanup release them.
+    if (produced === 0 && present.every(p => failCount.get(p.name) >= 2)) break;
 
     let speakerIdx = pickNextSpeaker(participants, lastSpeakerIdx, speakCount, conversation.lines);
     let speaker = participants[speakerIdx];
@@ -2549,6 +3528,35 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
       }
     }
 
+    // ── RECIPE-TEACHING BEAT (Phase 5) ── an expert passes on a whole invention
+    // (the knowledge, not just skill). The student LEARNS the recipe — granting
+    // knownTech directly — and is moved to try it. This is how oral tradition
+    // keeps a breakthrough alive across generations.
+    if (!signal?.aborted && speaker._pendingTechTeach) {
+      const student = others.find(o => o.name === speaker._pendingTechTeach.student);
+      const techId = speaker._pendingTechTeach.techId;
+      const tech = TECH_GRAPH[techId];
+      speaker._pendingTechTeach = null;
+      if (student && tech && !student.knownTech?.[techId]) {
+        const t = await generateTeaching(speaker, student, tech.label, signal);
+        if (t && isUsableDialogue(t.dialogue)) {
+          conversation.lines.push({ speaker: speaker.name, text: t.dialogue, thought: `(teaching ${student.name} how to make ${tech.label})`, mood: speaker.mood, addressedTo: student.name });
+          student.knownTech = { ...(student.knownTech || {}), [techId]: true };
+          if (tech.role && !student.techRole) student.techRole = tech.role;
+          addMemory(student, `${speaker.name} taught me how to make ${tech.label}.`, 'kindness', cs.day, { location: conversation.location, valence: 2 });
+          addMemory(speaker, `Passed on how to make ${tech.label} to ${student.name}.`, 'achievement', cs.day, { location: conversation.location, valence: 1.5 });
+          bumpReputation(cs, speaker.name, 'kind', 2);
+          bumpReputation(cs, speaker.name, 'skilled', 2);
+          setEmote(student, 'sparkle', 16);
+          const sr = student.relationships[speaker.name];
+          if (sr) { sr.affection = clamp(sr.affection + 4, 0, 100); sr.trust = clamp(sr.trust + 4, 0, 100); }
+          convos = gameRef.current.activeConversations.map(c => c.id === convoId ? { ...conversation, lines: [...conversation.lines] } : c);
+          gameRef.current = { ...gameRef.current, activeConversations: convos };
+          onUpdate();
+        }
+      }
+    }
+
     // let people leave once there's been a real exchange (not after line 1)
     if (!result.wants_to_continue && produced >= participants.length * 2) {
       if (participants.length > 2) {
@@ -2633,6 +3641,27 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
     events: [...gameRef.current.events.slice(-100), { day: gameRef.current.day, hour: gameRef.current.hour, participants: conversation.participants, summary: `${conversation.participants.join(', ')} chatted at ${conversation.location}`, lineCount: conversation.lines.length }],
   };
   onUpdate();
+  } finally {
+    // Safety net: release anyone still locked to this conversation and drop the
+    // (possibly empty) active entry. On the normal path these are already done,
+    // so this only fires if the body threw — preventing a permanent lock.
+    let needsRelease = false;
+    for (const p of participants) {
+      if (p.conversationId === convoId) {
+        p.conversationId = null;
+        p.conversationCooldown = 12 + Math.floor(Math.random() * 10);
+        p.activity = 'wandering';
+        needsRelease = true;
+      }
+    }
+    if (needsRelease) {
+      gameRef.current = {
+        ...gameRef.current,
+        activeConversations: gameRef.current.activeConversations.filter(c => c.id !== convoId),
+      };
+      onUpdate();
+    }
+  }
 }
 
 function pickNextSpeaker(participants, lastSpeakerIdx, speakCount, lines) {
@@ -2729,11 +3758,7 @@ export async function runAIAction(gameRef, personIdx, signal) {
     }
 
     case 'rest':
-      person.sleeping = true;
-      person.activity = 'sleeping';
-      setEmote(person, 'zzz', 200);
-      setGoal(person, 'sleep', null, 400);
-      if (person.home) { person.targetX = person.home.x; person.targetY = person.home.y; }
+      beginSleep(person, 400);
       break;
 
     case 'gather_food':
@@ -2839,6 +3864,38 @@ export async function runAIAction(gameRef, personIdx, signal) {
       break;
     }
 
+    case 'offer_shelter': {
+      // a homeowner invites a specific homeless villager to shelter in their home.
+      if (!person.home || !target) break;
+      const guest = cs.people.find(o =>
+        o.alive !== false && !o.isAvatar && o.name !== person.name &&
+        o.name.toLowerCase().includes(target.toLowerCase()) && !o.home);
+      if (!guest) break;
+      // share the home: the guest gains it as their shelter and joins the owners
+      guest.home = person.home;
+      if (!person.home.owners) person.home.owners = [person.name];
+      if (!person.home.owners.includes(guest.name)) person.home.owners.push(guest.name);
+      // walk the guest toward the home; the host gestures warmly
+      guest.targetX = person.home.x; guest.targetY = person.home.y;
+      guest.currentGoal = { type: 'shelter', target: person.name, until: 80 };
+      guest.activity = 'heading home';
+      guest.thought = `${person.name} offered me shelter — heading to their home.`;
+      setEmote(guest, 'sparkle', 24);
+      setEmote(person, 'heart', 24);
+      person.activity = 'welcoming';
+      setGoal(person, 'social', guest.name, 30);
+      // it's a kindness: memories + reputation + a relationship bump
+      addMemory(person, `Offered ${guest.name} shelter in my home.`, 'kindness', cs.day, { location: person.currentLocation, valence: 1.5 });
+      addMemory(guest, `${person.name} took me into their home — I won't forget it.`, 'kindness', cs.day, { location: person.currentLocation, valence: 2.5 });
+      bumpReputation(cs, person.name, 'kind', 4);
+      bumpReputation(cs, person.name, 'generous', 3);
+      const gr = guest.relationships[person.name];
+      if (gr) { gr.affection = clamp(gr.affection + 8, 0, 100); gr.trust = clamp(gr.trust + 8, 0, 100); }
+      cs.events.push({ day: cs.day, hour: cs.hour, participants: [person.name, guest.name],
+        summary: `🏠 ${person.name} took ${guest.name} in from the cold.`, type: 'kindness' });
+      break;
+    }
+
     case 'sit_and_think':
     case 'explore':
       if (target) goToLocation(person, target);
@@ -2860,19 +3917,69 @@ export async function runAIAction(gameRef, personIdx, signal) {
 }
 
 // initiate a build project by asking AI what to build
-async function startBuildProject(person, state) {
-  const { generateBuildPlan } = await import('./ai.js');
-  const partner = person.partner ? state.people.find(p => p.name === person.partner) : null;
-  const plan = await generateBuildPlan(person, partner, state);
-  if (!plan) return;
+// A sensible default plan used when the LLM is unavailable or fails, so a
+// villager's decision to build is never silently dropped. Homeless villagers
+// default to a shelter; others to a useful communal structure.
+function defaultBuildPlan(person) {
+  if (!person.home) {
+    return { type: 'shelter', description: 'a simple home to shelter from the cold',
+      estimated_quality: 'basic', materials_needed: { wood: 5, stone: 2, thatch: 2 } };
+  }
+  return { type: 'storage hut', description: 'a hut to store food and goods',
+    estimated_quality: 'basic', materials_needed: { wood: 4, stone: 1, thatch: 1 } };
+}
 
+// Is a tile clear enough to put a home on? Walkable, dry, and not sitting on (or
+// right next to) a resource node or an existing building — so houses don't land
+// on the rocks/clay/etc. that villagers harvest, and don't stack on each other.
+function isBuildableTile(state, grid, x, y) {
+  if (!nearestWalkableHere(grid, x, y)) return false;
+  const RES_CLEAR = 1.5; // keep homes off resource tiles (and their immediate edge)
+  for (const n of state.resourceNodes || []) {
+    if (Math.abs(n.x - x) <= RES_CLEAR && Math.abs(n.y - y) <= RES_CLEAR) return false;
+  }
+  const BLD_CLEAR = 2; // don't crowd existing buildings
+  for (const b of state.buildings || []) {
+    if (Math.abs(b.x - x) <= BLD_CLEAR && Math.abs(b.y - y) <= BLD_CLEAR) return false;
+  }
+  return true;
+}
+
+// True if exactly this tile (rounded) is walkable — used as a strict per-tile test
+// (unlike nearestWalkable, which would spiral to a different tile).
+function nearestWalkableHere(grid, x, y) {
+  const r = nearestWalkable(grid, x, y);
+  return r && r.x === Math.round(x) && r.y === Math.round(y);
+}
+
+// Pick a home site near the preferred spot that's walkable AND clear of resource
+// nodes / other buildings. Spirals outward from the preference so the villager's
+// chosen area is honored, only moving away as far as needed to find clear ground.
+function pickBuildSite(state, px, py, maxRadius = 8) {
+  const grid = getWalkableGrid(state);
+  const cx = Math.round(px), cy = Math.round(py);
+  if (isBuildableTile(state, grid, cx, cy)) return { x: cx, y: cy };
+  for (let r = 1; r <= maxRadius; r++) {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue; // ring only
+        const nx = clamp(cx + dx, 3, MAP_W - 4), ny = clamp(cy + dy, 3, MAP_H - 4);
+        if (isBuildableTile(state, grid, nx, ny)) return { x: nx, y: ny };
+      }
+    }
+  }
+  // last resort: any walkable tile near the preference (old behavior), then campfire
+  const dry = nearestWalkable(grid, cx, cy);
+  return dry ? { x: dry.x, y: dry.y } : { x: LOCATIONS.CAMPFIRE.x, y: LOCATIONS.CAMPFIRE.y };
+}
+
+// Attach a buildProject from a plan object (LLM-produced or a fallback). Pure
+// and synchronous — no LLM calls — so it's reusable by the god power and the
+// deterministic fallback path. Returns the created project.
+function createBuildProject(person, partner, state, plan) {
   const hx = LOCATIONS.CAMPFIRE.x + (Math.random() - 0.5) * 14;
   const hy = LOCATIONS.CAMPFIRE.y + (Math.random() - 0.5) * 10;
-  // snap to dry, walkable land so homes never spawn in water
-  const grid = getWalkableGrid(state);
-  const dry = nearestWalkable(grid, clamp(hx, 3, MAP_W - 4), clamp(hy, 3, MAP_H - 4))
-    || { x: LOCATIONS.CAMPFIRE.x, y: LOCATIONS.CAMPFIRE.y };
-  const site = { x: dry.x, y: dry.y };
+  const site = pickBuildSite(state, clamp(hx, 3, MAP_W - 4), clamp(hy, 3, MAP_H - 4));
 
   person.buildProject = {
     type: plan.type || 'shelter',
@@ -2891,9 +3998,36 @@ async function startBuildProject(person, state) {
   // share project with partner
   if (partner) partner.buildProject = person.buildProject;
 
-  addMemory(person, `Planning to build a ${plan.type}`, 'life', state.day);
+  addMemory(person, `Planning to build a ${person.buildProject.type}`, 'life', state.day);
   state.events.push({ day: state.day, hour: state.hour, participants: [person.name, partner?.name].filter(Boolean),
-    summary: `🏗 ${person.name} is planning to build a ${plan.type}!`, type: 'building' });
+    summary: `🏗 ${person.name} is planning to build a ${person.buildProject.type}!`, type: 'building' });
   setEmote(person, 'sparkle', 20);
-  person.thought = `I'm going to build a ${plan.type}!`;
+  person.thought = `I'm going to build a ${person.buildProject.type}!`;
+  return person.buildProject;
+}
+
+async function startBuildProject(person, state) {
+  if (person.buildProject) return; // already building
+  const partner = person.partner ? state.people.find(p => p.name === person.partner) : null;
+  let plan = null;
+  try {
+    const { generateBuildPlan } = await import('./ai.js');
+    plan = await generateBuildPlan(person, partner, state);
+  } catch { /* LLM unavailable — fall through to deterministic plan */ }
+  // The villager already decided to build; an LLM hiccup must not lose that.
+  if (!plan) plan = defaultBuildPlan(person);
+  // guard against a race where the project landed (or person died) during await
+  if (person.buildProject || person.alive === false) return;
+  createBuildProject(person, partner, state, plan);
+}
+
+// God power: force a chosen villager to begin building immediately, skipping the
+// LLM decision/plan entirely. Deterministic — for demoing the mechanic on demand.
+export function godStartBuild(state, personIndex) {
+  const person = state.people?.[personIndex];
+  if (!person || person.alive === false || person.isAvatar) return state;
+  if (person.buildProject) return state; // already building
+  const partner = person.partner ? state.people.find(p => p.name === person.partner) : null;
+  createBuildProject(person, partner, state, defaultBuildPlan(person));
+  return state;
 }
