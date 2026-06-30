@@ -1,4 +1,4 @@
-import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, MODEL_POOL, CHRONOTYPE_TRAITS, GROVE_DEPLETE, GROVE_REGROW_PER_DAY, POND_LEVEL_MAX, POND_LEVEL_MIN, POND_RAIN_GAIN, POND_EVAP, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, MODEL_SMOOTHING, MODEL_WEIGHT_FLOOR, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN, SCHEMA_VERSION, buildMaterialCatalog } from '../utils/constants.js';
+import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, GROVE_DEPLETE, GROVE_REGROW_PER_DAY, POND_LEVEL_MAX, POND_LEVEL_MIN, POND_RAIN_GAIN, POND_EVAP, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN, SCHEMA_VERSION, buildMaterialCatalog } from '../utils/constants.js';
 import { nearestWalkable } from './pathfinding.js';
 import { clearCompletedGoal } from './goals.js';
 import { nearestVisiblePrey, perceive } from './vision.js';
@@ -9,6 +9,7 @@ import { simlog } from './log.js';
 import { blankTechMetrics, recordAttempt, recordGate, recordMint, recordBreakthroughMetric, summarizeTech } from './tech/metrics.js';
 import { getTimeOfDay, personTimeOfDay, distBetween, locationAt, clamp, getWalkableGrid, moveToward, setGoal, goToLocation, goToPerson } from './movement.js';
 import { addMemory, decayMemories, personValence, weightedLocationPick, setEmote } from './memory.js';
+import { chronotypeFor, recordModelResult, reassignFlakyModels, pickModelWeighted } from './models.js';
 
 // ── Conversation Archive (persisted to localStorage) ──
 
@@ -173,58 +174,6 @@ function getLifeStage(age) {
   if (age < 18) return LIFE_STAGES.TEEN;
   if (age < 55) return LIFE_STAGES.ADULT;
   return LIFE_STAGES.ELDER;
-}
-
-// A person's chronotype from their traits — first matching group wins. Drives a
-// per-person shift of the daily schedule so the village isn't all on one clock.
-function chronotypeFor(traits = []) {
-  if (traits.some(t => CHRONOTYPE_TRAITS.night.includes(t))) return 'night';
-  if (traits.some(t => CHRONOTYPE_TRAITS.early.includes(t))) return 'early';
-  return 'normal';
-}
-
-// Record whether a model returned usable output, for the assignment router (#8).
-function recordModelResult(state, model, ok) {
-  if (!model || !state) return;
-  if (!state.modelStats) state.modelStats = {};
-  const s = state.modelStats[model] || (state.modelStats[model] = { calls: 0, ok: 0, fail: 0 });
-  s.calls++;
-  if (ok) s.ok++; else s.fail++;
-}
-
-// Once a day, move agents off a model that's proven unreliable to a weighted
-// pick from the pool — voices stay mostly stable, but a flaky model bleeds out
-// of rotation over time. Only acts on models with enough samples to judge.
-function reassignFlakyModels(state) {
-  const ms = state.modelStats;
-  if (!ms) return;
-  for (const p of state.people) {
-    if (p.alive === false) continue;
-    const s = ms[p.model];
-    if (!s || s.calls < 6) continue;
-    const rate = s.ok / s.calls;
-    if (rate < 0.5 && Math.random() < (0.5 - rate)) {
-      const next = pickModelWeighted(ms);
-      if (next && next !== p.model) p.model = next;
-    }
-  }
-}
-
-// Pick a model from the pool weighted by recent reliability (Laplace-smoothed
-// success rate), so flaky models get assigned less without ever being banned.
-// Falls back to uniform random when no stats exist yet.
-function pickModelWeighted(modelStats) {
-  if (!modelStats) return MODEL_POOL[Math.floor(Math.random() * MODEL_POOL.length)];
-  const weights = MODEL_POOL.map(m => {
-    const s = modelStats[m];
-    const ok = (s?.ok || 0) + MODEL_SMOOTHING;
-    const total = (s?.ok || 0) + (s?.fail || 0) + 2 * MODEL_SMOOTHING;
-    return Math.max(MODEL_WEIGHT_FLOOR, ok / total);
-  });
-  const sum = weights.reduce((a, b) => a + b, 0);
-  let r = Math.random() * sum;
-  for (let i = 0; i < MODEL_POOL.length; i++) { r -= weights[i]; if (r <= 0) return MODEL_POOL[i]; }
-  return MODEL_POOL[MODEL_POOL.length - 1];
 }
 
 // daily schedule slots
