@@ -1,0 +1,223 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="900" viewBox="0 0 1180 900" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#5b6b52"/>
+    </marker>
+    <marker id="arrowLLM" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#b08948"/>
+    </marker>
+    <style>
+      .title{ font-size:26px; font-weight:700; fill:#cfe0c0; letter-spacing:2px; }
+      .sub{ font-size:13px; fill:#8aa07a; }
+      .box{ fill:#1d2a1a; stroke:#3c5234; stroke-width:1.5; rx:8; }
+      .boxllm{ fill:#2a2212; stroke:#7a5d2a; stroke-width:1.5; rx:8; }
+      .boxgod{ fill:#241a2b; stroke:#5e4a73; stroke-width:1.5; rx:8; }
+      .group{ fill:none; stroke:#2c3a26; stroke-width:1.5; stroke-dasharray:5 4; rx:12; }
+      .h{ font-size:14px; font-weight:700; fill:#a9c596; }
+      .hllm{ font-size:14px; font-weight:700; fill:#d8ad63; }
+      .hgod{ font-size:14px; font-weight:700; fill:#bda0d6; }
+      .t{ font-size:11.5px; fill:#9fb392; }
+      .tg{ font-size:11px; fill:#7d9070; }
+      .glabel{ font-size:12px; font-weight:700; fill:#6f8462; letter-spacing:1px; }
+      .edge{ stroke:#5b6b52; stroke-width:1.6; fill:none; marker-end:url(#arrow); }
+      .edgellm{ stroke:#b08948; stroke-width:1.6; fill:none; marker-end:url(#arrowLLM); stroke-dasharray:6 3; }
+      .elabel{ font-size:10.5px; fill:#7d9070; }
+      .ellabel{ font-size:10.5px; fill:#b08948; }
+    </style>
+  </defs>
+
+  <rect width="1180" height="900" fill="#10160d"/>
+  <text x="40" y="48" class="title">VILLAGE LIFE — SIMULATION ARCHITECTURE</text>
+  <text x="40" y="70" class="sub">A real-time agent ecosystem. Deterministic systems run every tick; a gate escalates only the interesting moments to a language model.</text>
+
+  <!-- ============ CLOCK / LOOPS ============ -->
+  <rect x="40" y="100" width="300" height="150" class="group"/>
+  <text x="56" y="122" class="glabel">DRIVER · App.jsx</text>
+  <rect x="56" y="134" width="268" height="44" class="box"/>
+  <text x="70" y="153" class="h">tick loop · every 400ms / speed</text>
+  <text x="70" y="169" class="t">simulateTick(state) → render frame</text>
+  <rect x="56" y="184" width="131" height="56" class="box"/>
+  <text x="70" y="203" class="h">convo loop</text>
+  <text x="70" y="218" class="t">every 4000ms</text>
+  <text x="70" y="232" class="tg">runConversation</text>
+  <rect x="193" y="184" width="131" height="56" class="boxllm"/>
+  <text x="207" y="203" class="hllm">action loop</text>
+  <text x="207" y="218" class="t">every 2000ms</text>
+  <text x="207" y="232" class="tg">runAIAction / Ideation</text>
+
+  <!-- ============ TICK PIPELINE ============ -->
+  <rect x="40" y="280" width="720" height="380" class="group"/>
+  <text x="56" y="302" class="glabel">PER-TICK PIPELINE · simulation.js → simulateTick()</text>
+
+  <rect x="56" y="316" width="160" height="60" class="box"/>
+  <text x="70" y="335" class="h">advance clock</text>
+  <text x="70" y="350" class="t">minute → hour → day</text>
+  <text x="70" y="364" class="tg">season · weather</text>
+
+  <rect x="232" y="316" width="160" height="60" class="box"/>
+  <text x="246" y="335" class="h">needs.js</text>
+  <text x="246" y="350" class="t">hunger · tiredness</text>
+  <text x="246" y="364" class="tg">loneliness · mood</text>
+
+  <rect x="408" y="316" width="160" height="60" class="box"/>
+  <text x="422" y="335" class="h">scheduler.js</text>
+  <text x="422" y="350" class="t">daily slot → target</text>
+  <text x="422" y="364" class="tg">chronotype clock</text>
+
+  <rect x="584" y="316" width="160" height="60" class="box"/>
+  <text x="598" y="335" class="h">q.js + skills.js</text>
+  <text x="598" y="350" class="t">ε-greedy work pick</text>
+  <text x="598" y="364" class="tg">yield → skill → reward</text>
+
+  <rect x="56" y="392" width="160" height="60" class="box"/>
+  <text x="70" y="411" class="h">movement.js</text>
+  <text x="70" y="426" class="t">A* path · moveToward</text>
+  <text x="70" y="440" class="tg">vision.js line-of-sight</text>
+
+  <rect x="232" y="392" width="160" height="60" class="box"/>
+  <text x="246" y="411" class="h">food.js</text>
+  <text x="246" y="426" class="t">larder · patch yield</text>
+  <text x="246" y="440" class="tg">field crop cycle</text>
+
+  <rect x="408" y="392" width="160" height="60" class="box"/>
+  <text x="422" y="411" class="h">wildlife.js</text>
+  <text x="422" y="426" class="t">deer · boar · wolf</text>
+  <text x="422" y="440" class="tg">hunting · breeding</text>
+
+  <rect x="584" y="392" width="160" height="60" class="box"/>
+  <text x="598" y="411" class="h">lifecycle.js</text>
+  <text x="598" y="426" class="t">birth · age · illness</text>
+  <text x="598" y="440" class="tg">grief · frailty · death</text>
+
+  <rect x="56" y="468" width="160" height="58" class="box"/>
+  <text x="70" y="487" class="h">relationships</text>
+  <text x="70" y="502" class="t">affection · trust</text>
+  <text x="70" y="516" class="tg">stranger → partnered</text>
+
+  <rect x="232" y="468" width="160" height="58" class="box"/>
+  <text x="246" y="487" class="h">reputation.js</text>
+  <text x="246" y="502" class="t">5 social dimensions</text>
+  <text x="246" y="516" class="tg">gossip spreads belief</text>
+
+  <rect x="408" y="468" width="160" height="58" class="box"/>
+  <text x="422" y="487" class="h">memory.js</text>
+  <text x="422" y="502" class="t">episodic · valenced</text>
+  <text x="422" y="516" class="tg">decays over days</text>
+
+  <rect x="584" y="468" width="160" height="58" class="box"/>
+  <text x="598" y="487" class="h">build.js</text>
+  <text x="598" y="502" class="t">homes from wood/stone</text>
+  <text x="598" y="516" class="tg">sleep-at-home payoff</text>
+
+  <!-- The gate -->
+  <rect x="56" y="546" width="688" height="96" class="box" stroke="#7a5d2a"/>
+  <text x="70" y="568" class="hllm">escalation gate · needs.js → escalationGate()</text>
+  <rect x="74" y="580" width="206" height="50" rx="6" fill="#16210f" stroke="#3c5234"/>
+  <text x="86" y="600" class="h">REFLEX</text>
+  <text x="86" y="616" class="tg">sleep · eat · shelter — local, no LLM</text>
+  <rect x="290" y="580" width="206" height="50" rx="6" fill="#2a2212" stroke="#7a5d2a"/>
+  <text x="302" y="600" class="hllm">ESCALATE</text>
+  <text x="302" y="616" class="tg">set pendingLLM → action loop</text>
+  <rect x="506" y="580" width="220" height="50" rx="6" fill="#16210f" stroke="#3c5234"/>
+  <text x="518" y="600" class="h">IDLE</text>
+  <text x="518" y="616" class="tg">cheap schedule + Q-learning drive it</text>
+
+  <!-- ============ LLM COGNITION ============ -->
+  <rect x="790" y="280" width="350" height="380" class="group" stroke="#7a5d2a"/>
+  <text x="806" y="302" class="glabel" fill="#b08948">LANGUAGE-MODEL COGNITION</text>
+
+  <rect x="806" y="316" width="318" height="58" class="boxllm"/>
+  <text x="820" y="335" class="hllm">conversation.js</text>
+  <text x="820" y="350" class="t">multi-person dialogue · gossip</text>
+  <text x="820" y="364" class="tg">recipe-teaching beats</text>
+
+  <rect x="806" y="384" width="318" height="58" class="boxllm"/>
+  <text x="820" y="403" class="hllm">runAIAction</text>
+  <text x="820" y="418" class="t">pick goal · movement · activity</text>
+  <text x="820" y="432" class="tg">only for escalated agents</text>
+
+  <rect x="806" y="452" width="318" height="74" class="boxllm" stroke="#caa050" stroke-width="2.5"/>
+  <text x="820" y="471" class="hllm">tech.js — invention pipeline</text>
+  <text x="820" y="486" class="t">discover → ideate (LLM) → ⟦physics gate⟧</text>
+  <text x="820" y="500" class="t">→ prototype → derive material → teach</text>
+  <text x="820" y="516" class="tg">gate laws: resolve · whitelist · prereq · conserve</text>
+
+  <rect x="806" y="536" width="318" height="106" class="boxllm"/>
+  <text x="820" y="555" class="hllm">ai.js · providers/</text>
+  <text x="820" y="572" class="t">openrouter · openai · local (no-key)</text>
+  <text x="820" y="588" class="tg">per-agent model = distinct voice</text>
+  <text x="820" y="604" class="tg">models.js routes by reliability</text>
+  <text x="820" y="622" class="tg">physics gate keeps output grounded</text>
+
+  <!-- ============ WORLD STATE ============ -->
+  <rect x="40" y="690" width="500" height="170" class="group"/>
+  <text x="56" y="712" class="glabel">WORLD STATE · createSimulation()</text>
+  <rect x="56" y="724" width="150" height="50" class="box"/>
+  <text x="70" y="743" class="h">8 villagers</text>
+  <text x="70" y="759" class="tg">person.js · needs · skills</text>
+  <rect x="214" y="724" width="150" height="50" class="box"/>
+  <text x="228" y="743" class="h">44×32 tile map</text>
+  <text x="228" y="759" class="tg">terrain.js · 9 locations</text>
+  <rect x="372" y="724" width="158" height="50" class="box"/>
+  <text x="386" y="743" class="h">shared larder</text>
+  <text x="386" y="759" class="tg">patches · field · pond</text>
+  <rect x="56" y="784" width="150" height="50" class="box"/>
+  <text x="70" y="803" class="h">wildlife</text>
+  <text x="70" y="819" class="tg">5 species</text>
+  <rect x="214" y="784" width="150" height="50" class="box"/>
+  <text x="228" y="803" class="h">tech catalogs</text>
+  <text x="228" y="819" class="tg">recipes · materials</text>
+  <rect x="372" y="784" width="152" height="50" class="box"/>
+  <text x="386" y="803" class="h">reputation · stats</text>
+  <text x="386" y="819" class="tg">events · conversations</text>
+
+  <!-- ============ RENDER + PERSIST ============ -->
+  <rect x="560" y="690" width="270" height="170" class="group"/>
+  <text x="576" y="712" class="glabel">RENDER · renderer/</text>
+  <rect x="576" y="724" width="238" height="54" class="box"/>
+  <text x="590" y="743" class="h">GameRenderer.js · PixiJS</text>
+  <text x="590" y="758" class="t">terrain · sprites · bubbles</text>
+  <text x="590" y="772" class="tg">day/night · weather · vision</text>
+  <rect x="576" y="786" width="238" height="48" class="box"/>
+  <text x="590" y="805" class="h">archive.js + dev API</text>
+  <text x="590" y="821" class="tg">conversations.jsonl · world snapshots</text>
+
+  <!-- ============ GOD ============ -->
+  <rect x="850" y="690" width="290" height="170" class="group" stroke="#5e4a73"/>
+  <text x="866" y="712" class="glabel" fill="#9d7fbb">THE PLAYER (GOD)</text>
+  <rect x="866" y="724" width="258" height="54" class="boxgod"/>
+  <text x="880" y="743" class="hgod">GodPowers.jsx — 12 powers</text>
+  <text x="880" y="758" class="t">smite · bless · whisper · storm</text>
+  <text x="880" y="772" class="tg">feast · plague · quake · matchmake…</text>
+  <rect x="866" y="786" width="258" height="48" class="boxgod"/>
+  <text x="880" y="805" class="hgod">avatar.js — walk among them</text>
+  <text x="880" y="821" class="tg">Deity (awe) or Stranger · speak · miracle</text>
+
+  <!-- ======= EDGES ======= -->
+  <!-- driver to tick pipeline -->
+  <path class="edge" d="M190 250 L 200 280"/>
+  <!-- action loop to LLM -->
+  <path class="edgellm" d="M324 212 C 560 212, 700 290, 805 330"/>
+  <text x="560" y="240" class="ellabel">pendingLLM / pendingIdea</text>
+  <!-- convo loop to conversation -->
+  <path class="edgellm" d="M187 200 C 760 150, 900 240, 940 316"/>
+
+  <!-- gate ESCALATE -> LLM cognition -->
+  <path class="edgellm" d="M496 605 C 660 605, 700 460, 805 420"/>
+  <text x="600" y="560" class="ellabel">escalate</text>
+
+  <!-- LLM cognition writes back to world state -->
+  <path class="edgellm" d="M806 590 C 600 660, 500 670, 430 688"/>
+  <text x="560" y="678" class="ellabel">mutates people / recipes</text>
+
+  <!-- tick pipeline -> world state -->
+  <path class="edge" d="M300 660 L 300 688"/>
+  <text x="312" y="680" class="elabel">read + write</text>
+
+  <!-- world state -> render -->
+  <path class="edge" d="M540 760 L 574 760"/>
+
+  <!-- god -> world state -->
+  <path class="edge" d="M864 815 C 720 850, 640 800, 540 768" marker-end="url(#arrow)" stroke="#9d7fbb"/>
+  <text x="612" y="846" class="elabel" fill="#9d7fbb">intervene</text>
+</svg>
