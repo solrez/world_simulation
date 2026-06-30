@@ -1,5 +1,5 @@
-import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, MODEL_POOL, CHRONOTYPE_OFFSET, CHRONOTYPE_TRAITS, GROVE_DEPLETE, GROVE_REGROW_PER_DAY, POND_LEVEL_MAX, POND_LEVEL_MIN, POND_RAIN_GAIN, POND_EVAP, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, MODEL_SMOOTHING, MODEL_WEIGHT_FLOOR, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN, SCHEMA_VERSION, buildMaterialCatalog } from '../utils/constants.js';
-import { buildWalkableGrid, findPath, nearestWalkable } from './pathfinding.js';
+import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, MODEL_POOL, CHRONOTYPE_TRAITS, GROVE_DEPLETE, GROVE_REGROW_PER_DAY, POND_LEVEL_MAX, POND_LEVEL_MIN, POND_RAIN_GAIN, POND_EVAP, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, MODEL_SMOOTHING, MODEL_WEIGHT_FLOOR, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN, SCHEMA_VERSION, buildMaterialCatalog } from '../utils/constants.js';
+import { nearestWalkable } from './pathfinding.js';
 import { clearCompletedGoal } from './goals.js';
 import { nearestVisiblePrey, perceive } from './vision.js';
 import { generateGroupDialogue, generateAction, generateGossip, generateTeaching, generateIdeation, generateAvatarReply } from './ai.js';
@@ -7,6 +7,8 @@ import { physicsGate } from './tech/physics.js';
 import { mintRecipe } from './tech/derive.js';
 import { simlog } from './log.js';
 import { blankTechMetrics, recordAttempt, recordGate, recordMint, recordBreakthroughMetric, summarizeTech } from './tech/metrics.js';
+import { getTimeOfDay, personTimeOfDay, distBetween, locationAt, clamp, getWalkableGrid, moveToward, setGoal, goToLocation, goToPerson } from './movement.js';
+import { addMemory, decayMemories, personValence, weightedLocationPick, setEmote } from './memory.js';
 
 // ── Conversation Archive (persisted to localStorage) ──
 
@@ -728,96 +730,6 @@ function processHunting(person, state) {
 
 // ── Helpers ──
 
-function getTimeOfDay(hour) {
-  if (hour < 6) return 'night';
-  if (hour < 10) return 'morning';
-  if (hour < 14) return 'midday';
-  if (hour < 18) return 'afternoon';
-  if (hour < 21) return 'evening';
-  return 'night';
-}
-
-// The schedule slot a person is on RIGHT NOW, after shifting the world clock by
-// their chronotype. An early-riser experiences "morning/work" before dawn; a
-// night-owl is still in "free/social" when others have gone to sleep.
-function personTimeOfDay(person, state) {
-  const off = CHRONOTYPE_OFFSET[person.chronotype] ?? 0;
-  const h = (((state.hour + (state.minute || 0) / 60) - off) % 24 + 24) % 24;
-  return getTimeOfDay(h);
-}
-function distBetween(a, b) { return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2); }
-function locationAt(x, y) {
-  for (const [, loc] of Object.entries(LOCATIONS))
-    if (Math.abs(x - loc.x) < 2 && Math.abs(y - loc.y) < 2) return loc.name;
-  return 'village';
-}
-function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
-
-// Walkable grid is cached per simulation state and (re)built when terrain or
-// the building set changes. Movement routes around water via A*.
-function getWalkableGrid(state) {
-  if (!state._walkGrid) state._walkGrid = buildWalkableGrid(state.terrain);
-  return state._walkGrid;
-}
-
-function moveToward(person, tx, ty, state) {
-  const dist = Math.sqrt((tx - person.x) ** 2 + (ty - person.y) ** 2);
-  if (dist < 0.5) { person.targetX = null; person.targetY = null; person.path = null; return true; }
-  const spd = person.tiredness > 80 ? person.speed * 0.7 : person.speed;
-
-  // (Re)compute an A* path when the destination changes. Without a state/grid
-  // (e.g. legacy callers) fall back to straight-line movement.
-  const grid = state ? getWalkableGrid(state) : null;
-  if (grid) {
-    const destKey = `${Math.round(tx)},${Math.round(ty)}`;
-    if (person._pathDest !== destKey) {
-      person._pathDest = destKey;
-      person.path = findPath(grid, { x: person.x, y: person.y }, { x: tx, y: ty });
-    }
-    if (person.path && person.path.length) {
-      // steer toward the next waypoint tile centre; pop it once reached
-      const wp = person.path[0];
-      const wdx = wp.x - person.x, wdy = wp.y - person.y;
-      const wd = Math.sqrt(wdx * wdx + wdy * wdy);
-      if (wd < 0.4) { person.path.shift(); return false; }
-      person.x += (wdx / wd) * spd;
-      person.y += (wdy / wd) * spd;
-      return false;
-    }
-    // path is empty (already at goal tile) or null (unreachable) → home in on the
-    // exact target, but only across walkable ground.
-  }
-
-  // final approach / fallback: straight line toward the exact target
-  const dx = tx - person.x, dy = ty - person.y;
-  const nx = person.x + (dx / dist) * spd, ny = person.y + (dy / dist) * spd;
-  if (!grid || nearestWalkable(grid, nx, ny)) {
-    // only step if the destination tile is walkable (or no grid available)
-    const tileWalkable = !grid || grid[Math.round(ny)]?.[Math.round(nx)];
-    if (tileWalkable) { person.x = nx; person.y = ny; }
-  }
-  return false;
-}
-
-function setGoal(person, type, target, duration) {
-  person.currentGoal = { type, target: target || null, until: duration || 30 };
-}
-
-function goToLocation(person, locName) {
-  const loc = Object.values(LOCATIONS).find(l => l.name.toLowerCase().includes(locName.toLowerCase()));
-  if (loc) {
-    person.targetX = loc.x + (Math.random() - 0.5) * 2;
-    person.targetY = loc.y + (Math.random() - 0.5) * 2;
-    person.targetX = clamp(person.targetX, 1, MAP_W - 2);
-    person.targetY = clamp(person.targetY, 1, MAP_H - 2);
-  }
-}
-
-function goToPerson(person, target) {
-  person.targetX = target.x + (Math.random() - 0.5) * 1;
-  person.targetY = target.y + (Math.random() - 0.5) * 1;
-}
-
 // Which productive action to do, ε-greedy over learned Q-values. This is the
 // local adaptation between LLM calls: agents lean into what's worked, but still
 // explore (Q_EPSILON) so they discover hunting/building pay off.
@@ -963,71 +875,6 @@ function pickExploreTarget(person) {
   person.targetY = clamp(person.targetY, 1, MAP_H - 2);
   person.activity = 'exploring';
   setGoal(person, 'wander', null, 30);
-}
-
-function addMemory(person, text, type, day, opts = {}) {
-  const valence = opts.valence ?? MEMORY_VALENCE[type] ?? 0;
-  const location = opts.location ?? null;
-  person.memories.push({ text, type, day, valence, location, weight: Math.abs(valence) });
-  if (person.memories.length > 30) person.memories.shift();
-}
-
-// Decay memory weights toward zero over days and prune faded ones. Cheap —
-// called once per game-day, not per tick.
-function decayMemories(person, state) {
-  if (!person.memories?.length) return;
-  person.memories = person.memories.filter(m => {
-    if (m.valence === undefined) return true; // legacy memory, never anchored
-    const ageDays = Math.max(0, state.day - m.day);
-    const halfLife = m.valence < 0 ? MEMORY_HALF_LIFE_BAD : MEMORY_HALF_LIFE_GOOD;
-    m.weight = Math.abs(m.valence) * Math.pow(0.5, ageDays / halfLife);
-    return m.weight >= MEMORY_MIN_WEIGHT;
-  });
-}
-
-// Signed feeling about a place: sum of decayed weights * sign(valence) over
-// memories anchored to that location. Positive = drawn to it, negative = avoid.
-function locationValence(person, locName) {
-  if (!person.memories?.length) return 0;
-  let sum = 0;
-  for (const m of person.memories) {
-    if (m.location === locName && m.valence) sum += m.weight * Math.sign(m.valence);
-  }
-  return sum;
-}
-
-// Signed feeling about another person, by name, from memories that mention them.
-function personValence(person, otherName) {
-  if (!person.memories?.length || !otherName) return 0;
-  // Match the name as a whole word so e.g. "Mara" doesn't match "Marabel".
-  const nameRe = new RegExp(`\\b${otherName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-  let sum = 0;
-  for (const m of person.memories) {
-    if (m.valence && m.text && nameRe.test(m.text)) sum += m.weight * Math.sign(m.valence);
-  }
-  return sum;
-}
-
-// Softmax over candidate location names weighted by the person's feelings about
-// each. A strong aversion sharply downweights but never hard-bans a place;
-// a fond memory upweights it. With no memories this is a uniform random pick.
-function weightedLocationPick(person, names) {
-  if (!names?.length) return null;
-  if (!person.memories?.length) return names[Math.floor(Math.random() * names.length)];
-  const weights = names.map(n => Math.exp(locationValence(person, n) * MEMORY_LOCATION_SENSITIVITY));
-  const total = weights.reduce((a, b) => a + b, 0);
-  if (!(total > 0)) return names[Math.floor(Math.random() * names.length)];
-  let r = Math.random() * total;
-  for (let i = 0; i < names.length; i++) {
-    r -= weights[i];
-    if (r <= 0) return names[i];
-  }
-  return names[names.length - 1];
-}
-
-function setEmote(person, emote, duration) {
-  person.emote = emote;
-  person.emoteTimer = duration || 25;
 }
 
 // ── Relationship stages ──
