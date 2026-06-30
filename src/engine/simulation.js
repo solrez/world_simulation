@@ -1,4 +1,4 @@
-import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, GROVE_DEPLETE, GROVE_REGROW_PER_DAY, POND_LEVEL_MAX, POND_LEVEL_MIN, POND_RAIN_GAIN, POND_EVAP, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN, SCHEMA_VERSION, buildMaterialCatalog } from '../utils/constants.js';
+import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN, SCHEMA_VERSION, buildMaterialCatalog } from '../utils/constants.js';
 import { nearestWalkable } from './pathfinding.js';
 import { clearCompletedGoal } from './goals.js';
 import { nearestVisiblePrey, perceive } from './vision.js';
@@ -10,6 +10,7 @@ import { blankTechMetrics, recordAttempt, recordGate, recordMint, recordBreakthr
 import { getTimeOfDay, personTimeOfDay, distBetween, locationAt, clamp, getWalkableGrid, moveToward, setGoal, goToLocation, goToPerson } from './movement.js';
 import { addMemory, decayMemories, personValence, weightedLocationPick, setEmote } from './memory.js';
 import { chronotypeFor, recordModelResult, reassignFlakyModels, pickModelWeighted } from './models.js';
+import { addFood, totalFood, eatFood, takeFromLarder, patchYield, depletePatch, depleteGrove, regrowPatches, updatePond, growField, fieldReady } from './food.js';
 
 // ── Conversation Archive (persisted to localStorage) ──
 
@@ -1687,76 +1688,6 @@ function gainSkill(person, skill, amount = SKILL_GAIN_ON_SUCCESS) {
 }
 
 // ── Typed food economy ──
-function emptyLarder() { return { meat: 0, fish: 0, berries: 0, crops: 0 }; }
-function addFood(person, type, amount) {
-  if (!person.larder) person.larder = emptyLarder();
-  person.larder[type] = (person.larder[type] || 0) + amount;
-}
-function totalFood(holder) {
-  const l = holder.larder; if (!l) return 0;
-  return (l.meat || 0) + (l.fish || 0) + (l.berries || 0) + (l.crops || 0);
-}
-// Eat the most-abundant food on hand; returns the hunger restored, or 0 if none.
-// Eating a *different* type than last time gives a small variety mood bonus.
-function eatFood(person) {
-  const l = person.larder; if (!l) return 0;
-  let best = null, max = 0;
-  for (const t of Object.keys(FOOD_TYPES)) if ((l[t] || 0) > max) { max = l[t]; best = t; }
-  if (!best) return 0;
-  l[best]--;
-  const restore = FOOD_TYPES[best].hunger;
-  person.hunger = clamp(person.hunger - restore, 0, 100);
-  if (person.lastEaten && person.lastEaten !== best && person.mood === 'neutral') person.mood = 'content';
-  person.lastEaten = best;
-  return restore;
-}
-
-// Eat from the shared village larder (most abundant type). Returns hunger restored.
-function takeFromLarder(state, person) {
-  const l = state.larder; if (!l) return 0;
-  let best = null, max = 0;
-  for (const t of Object.keys(FOOD_TYPES)) if ((l[t] || 0) > max) { max = l[t]; best = t; }
-  if (!best) return 0;
-  l[best]--;
-  const restore = FOOD_TYPES[best].hunger * 0.85; // village fare slightly less filling
-  person.hunger = clamp(person.hunger - restore, 0, 100);
-  person.lastEaten = best;
-  return restore;
-}
-
-// ── Resource patches (depletion + regrowth) ──
-function patchYield(state, name) {
-  if (!state.patches) state.patches = {};
-  const v = state.patches[name];
-  return v == null ? 1 : v;
-}
-function depletePatch(state, name) {
-  if (!state.patches) state.patches = {};
-  const cur = state.patches[name] == null ? 1 : state.patches[name];
-  state.patches[name] = Math.max(PATCH_MIN, cur - PATCH_DEPLETE);
-}
-function depleteGrove(state) {
-  if (!state.patches) state.patches = {};
-  const cur = state.patches['Grove'] == null ? 1 : state.patches['Grove'];
-  state.patches['Grove'] = Math.max(PATCH_MIN, cur - GROVE_DEPLETE);
-}
-function regrowPatches(state) {
-  if (!state.patches) return;
-  for (const k of Object.keys(state.patches)) {
-    // the Grove recovers more slowly than berry/fishing patches — trees take time
-    const rate = k === 'Grove' ? GROVE_REGROW_PER_DAY : PATCH_REGROW_PER_DAY;
-    state.patches[k] = Math.min(1, state.patches[k] + rate);
-  }
-}
-
-// Pond level rises with rain, evaporates in dry seasons — drives the visible water.
-function updatePond(state) {
-  if (!state.pond) state.pond = { level: 1 };
-  const rained = state.weather === 'rainy' || state.weather === 'storm';
-  let lvl = state.pond.level + (rained ? POND_RAIN_GAIN : 0) - (POND_EVAP[state.season] || 0.02);
-  state.pond.level = clamp(lvl, POND_LEVEL_MIN, POND_LEVEL_MAX);
-}
-
 // ── Reputation ──
 // Nudge the village's collective read on `name` along one dimension, and slowly
 // decay everyone's standing toward neutral so reputations must be re-earned.
@@ -1818,17 +1749,6 @@ function reputationLabel(state, name) {
   const NEG = { generous: 'selfish', kind: 'cold', skilled: 'unskilled', reliable: 'unreliable', brave: 'timid' };
   return best.val > 0 ? POS[best.dim] : NEG[best.dim];
 }
-
-// ── Farming: the communal field grows over days, only in growing seasons ──
-// Sown crops creep forward on their own each day; tending (a work action) speeds
-// it. Winter freezes progress so a field sown too late just sits — Q learns that.
-function growField(state) {
-  const f = state.field;
-  if (!f || !f.planted) return;
-  if (!FARM.GROW_SEASONS.includes(state.season)) return; // frozen in winter
-  f.stage = Math.min(FARM.RIPE, f.stage + FARM.PASSIVE_GROW_PER_DAY);
-}
-function fieldReady(state) { return state.field?.planted && state.field.stage >= FARM.RIPE; }
 
 // ── Q-learning-lite: agents learn which actions pay off, per season ──
 // Coarse context keeps the table tiny so it learns fast and stays inspectable.
