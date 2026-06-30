@@ -1,4 +1,4 @@
-import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN, SCHEMA_VERSION, buildMaterialCatalog } from '../utils/constants.js';
+import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, Q_EPSILON, SEASON_ABUNDANCE, FARM, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN, SCHEMA_VERSION, buildMaterialCatalog } from '../utils/constants.js';
 import { nearestWalkable } from './pathfinding.js';
 import { clearCompletedGoal } from './goals.js';
 import { nearestVisiblePrey, perceive } from './vision.js';
@@ -12,6 +12,7 @@ import { addMemory, decayMemories, personValence, weightedLocationPick, setEmote
 import { chronotypeFor, recordModelResult, reassignFlakyModels, pickModelWeighted } from './models.js';
 import { addFood, totalFood, eatFood, takeFromLarder, patchYield, depletePatch, depleteGrove, regrowPatches, updatePond, growField, fieldReady } from './food.js';
 import { blankReputation, bumpReputation, decayReputation, pickGossipTarget, applyGossip, reputationLabel } from './reputation.js';
+import { rewardAction, topSkill, bestSpecialist, qValue, qBestActions } from './q.js';
 
 // ── Conversation Archive (persisted to localStorage) ──
 
@@ -1682,60 +1683,6 @@ function gainSkill(person, skill, amount = SKILL_GAIN_ON_SUCCESS) {
 }
 
 // ── Typed food economy ──
-
-// ── Q-learning-lite: agents learn which actions pay off, per season ──
-// Coarse context keeps the table tiny so it learns fast and stays inspectable.
-function qContext(person, state) {
-  const need = person.hunger > 60 ? 'hungry' : person.tiredness > 60 ? 'tired' : 'ok';
-  return `${state.season}|${need}`;
-}
-// Incremental Q update: estimate moves ALPHA of the way toward observed reward.
-function rewardAction(person, action, reward, state) {
-  if (!person.qValues) person.qValues = {};
-  if (!person.actionStats) person.actionStats = {};
-  const key = `${qContext(person, state)}:${action}`;
-  const q = person.qValues[key] ?? 0;
-  person.qValues[key] = q + Q_ALPHA * (reward - q);
-  const s = person.actionStats[action] || { tries: 0, total: 0 };
-  s.tries++; s.total += reward;
-  person.actionStats[action] = s;
-}
-// The skill a person is best at — their emerging identity in the village.
-function topSkill(person) {
-  let best = null, max = 8; // must be meaningfully skilled to "be" something
-  for (const [k, v] of Object.entries(person.skills || {})) if (v > max) { max = v; best = k; }
-  return best;
-}
-
-// The village's go-to person for a given skill (its best living practitioner
-// above a competence floor), excluding `exclude`. Powers specialist-seeking (#5):
-// the sick seek the best healer, the hungry the best provider, etc.
-function bestSpecialist(people, skill, exclude, floor = 20) {
-  let best = null, max = floor;
-  for (const p of people) {
-    if (p.alive === false || p === exclude || p.name === exclude?.name) continue;
-    const v = p.skills?.[skill] || 0;
-    if (v > max) { max = v; best = p; }
-  }
-  return best;
-}
-
-// Learned value of one action in the current context (0 if untried).
-function qValue(person, state, action) {
-  if (!person.qValues) return 0;
-  return person.qValues[`${qContext(person, state)}:${action}`] ?? 0;
-}
-
-// Top actions by learned value in the current context (for prompts/fallback).
-function qBestActions(person, state, n = 3) {
-  if (!person.qValues) return [];
-  const ctx = qContext(person, state);
-  const rows = Object.entries(person.qValues)
-    .filter(([k]) => k.startsWith(ctx + ':'))
-    .map(([k, v]) => ({ action: k.split(':')[1], value: v }))
-    .sort((a, b) => b.value - a.value);
-  return rows.slice(0, n);
-}
 
 // ════════════════════════════════════════════════════════════════════════════
 // INVENTION & TECH  (Phases 1-5, 7)
