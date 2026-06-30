@@ -30,7 +30,7 @@ export function InventionLog({ inventions = [], knownTech = {} }) {
 // What the village collectively knows how to do RIGHT NOW, and who keeps each
 // secret alive. If only one living soul holds a recipe, it's flagged at-risk —
 // surfacing the oral-tradition stakes.
-export function VillageKnowledge({ knownTech = {}, people = [] }) {
+export function VillageKnowledge({ knownTech = {}, people = [], recipeCatalog = {} }) {
   const alive = people.filter(p => p.alive !== false);
   const entries = Object.entries(knownTech);
   return (
@@ -40,7 +40,7 @@ export function VillageKnowledge({ knownTech = {}, people = [] }) {
         <div className="no-selection">The village knows no crafts beyond the basics.</div>
       ) : (
         entries.map(([techId, info]) => {
-          const tech = TECH_GRAPH[techId];
+          const tech = recipeCatalog[techId] || TECH_GRAPH[techId];
           const keepers = alive.filter(p => p.knownTech?.[techId]).map(p => p.name);
           return (
             <div key={techId} className="knowledge-entry">
@@ -51,6 +51,28 @@ export function VillageKnowledge({ knownTech = {}, people = [] }) {
           );
         })
       )}
+    </div>
+  );
+}
+
+// ── Tech Metrics (Phase 4) ──
+// The "is discovery working at the right RATES" view: experiments, success rate,
+// what the village has discovered, and what's currently blocking ideas.
+export function TechMetrics({ metrics, materialCatalog = {} }) {
+  if (!metrics) return null;
+  const { attempts = 0, successes = 0, recipesMinted = 0, gatePasses = 0, gateRejects = 0, rejectReasons = {} } = metrics;
+  const rate = attempts ? Math.round((successes / attempts) * 100) : 0;
+  const derivedMats = Object.values(materialCatalog).filter(m => m.origin === 'derived').length;
+  const topReject = Object.entries(rejectReasons).sort((a, b) => b[1] - a[1])[0];
+  return (
+    <div className="panel-section tech-metrics">
+      <div className="section-label">🧪 Discovery</div>
+      <div className="metric-row"><span>Experiments</span><span>{attempts}</span></div>
+      <div className="metric-row"><span>Success rate</span><span>{rate}%</span></div>
+      <div className="metric-row"><span>Recipes invented</span><span>{recipesMinted}</span></div>
+      <div className="metric-row"><span>New materials</span><span>{derivedMats}</span></div>
+      <div className="metric-row"><span>Ideas gated</span><span>{gatePasses}✓ / {gateRejects}✗</span></div>
+      {topReject && <div className="metric-note">Most blocked by: {topReject[0]} ({topReject[1]})</div>}
     </div>
   );
 }

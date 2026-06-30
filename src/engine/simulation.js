@@ -1,8 +1,12 @@
-import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, MODEL_POOL, CHRONOTYPE_OFFSET, CHRONOTYPE_TRAITS, GROVE_DEPLETE, GROVE_REGROW_PER_DAY, POND_LEVEL_MAX, POND_LEVEL_MIN, POND_RAIN_GAIN, POND_EVAP, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, MODEL_SMOOTHING, MODEL_WEIGHT_FLOOR, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN } from '../utils/constants.js';
+import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, MEMORY_VALENCE, MEMORY_HALF_LIFE_GOOD, MEMORY_HALF_LIFE_BAD, MEMORY_MIN_WEIGHT, MEMORY_LOCATION_SENSITIVITY, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, PATCH_MIN, PATCH_DEPLETE, PATCH_REGROW_PER_DAY, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, MODEL_POOL, CHRONOTYPE_OFFSET, CHRONOTYPE_TRAITS, GROVE_DEPLETE, GROVE_REGROW_PER_DAY, POND_LEVEL_MAX, POND_LEVEL_MIN, POND_RAIN_GAIN, POND_EVAP, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, MODEL_SMOOTHING, MODEL_WEIGHT_FLOOR, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN, SCHEMA_VERSION, buildMaterialCatalog } from '../utils/constants.js';
 import { buildWalkableGrid, findPath, nearestWalkable } from './pathfinding.js';
 import { clearCompletedGoal } from './goals.js';
 import { nearestVisiblePrey, perceive } from './vision.js';
 import { generateGroupDialogue, generateAction, generateGossip, generateTeaching, generateIdeation, generateAvatarReply } from './ai.js';
+import { physicsGate } from './tech/physics.js';
+import { mintRecipe } from './tech/derive.js';
+import { simlog } from './log.js';
+import { blankTechMetrics, recordAttempt, recordGate, recordMint, recordBreakthroughMetric, summarizeTech } from './tech/metrics.js';
 
 // ── Conversation Archive (persisted to localStorage) ──
 
@@ -396,6 +400,55 @@ function blankReputation() {
   return r;
 }
 
+// ── Catalog access (Phase 0) ──
+// A deep-ish clone of the hidden TECH_GRAPH seed into a mutable per-run catalog.
+// Recipe nodes are shallow data (no functions), so we clone fields and copy the
+// array-valued ones (prereqs / matches) and the effect object defensively, so a
+// runtime mutation to one run's catalog never leaks back into the constant.
+function cloneRecipeCatalog() {
+  const cat = {};
+  for (const [id, tech] of Object.entries(TECH_GRAPH)) {
+    cat[id] = {
+      ...tech,
+      prereqMaterials: [...(tech.prereqMaterials || [])],
+      prereqKnowledge: [...(tech.prereqKnowledge || [])],
+      matches: [...(tech.matches || [])],
+      effect: { ...(tech.effect || {}) },
+    };
+  }
+  return cat;
+}
+
+// The one read path for a recipe by id. Reads the runtime catalog, falling back
+// to the TECH_GRAPH seed so a half-migrated/older save (no recipeCatalog yet)
+// still resolves built-in techs. All engine code goes through this, never
+// TECH_GRAPH[id] directly, so minted recipes are visible everywhere.
+function recipeFor(state, id) {
+  return state?.recipeCatalog?.[id] || TECH_GRAPH[id];
+}
+
+// All recipes available this run (built-ins + any minted). Used by the idea
+// matcher and anything that iterates the whole graph.
+function allRecipes(state) {
+  return Object.values(state?.recipeCatalog || TECH_GRAPH);
+}
+
+// Upgrade a loaded save in place to the current SCHEMA_VERSION. Older saves
+// predate the runtime catalogs; seed them so the rest of the engine finds them.
+// Add a new `if (v < N)` block for each future schema bump — never break on load.
+export function migrateState(state) {
+  if (!state || typeof state !== 'object') return state;
+  const v = state.schemaVersion || 0;
+  if (v < 1) {
+    if (!state.recipeCatalog) state.recipeCatalog = cloneRecipeCatalog();
+    if (!state.materialCatalog) state.materialCatalog = buildMaterialCatalog();
+    if (!state.rejectedCombos) state.rejectedCombos = {};
+    if (!state.techMetrics) state.techMetrics = blankTechMetrics();
+  }
+  state.schemaVersion = SCHEMA_VERSION;
+  return state;
+}
+
 export function createSimulation() {
   const terrain = generateTerrain();
   const people = PERSONALITIES.map((p, i) => initPerson(p, i));
@@ -403,6 +456,8 @@ export function createSimulation() {
   const reputation = {};
   for (const p of people) reputation[p.name] = blankReputation();
   return {
+    // schema version of this state shape — read by migrateState() on load
+    schemaVersion: SCHEMA_VERSION,
     terrain, people, buildings: [],
     wildlife: spawnInitialWildlife(),
     day: 1, hour: 8, minute: 0,
@@ -422,6 +477,18 @@ export function createSimulation() {
     // noticed each (renderer reveals a node once anyone has). Cloned from the
     // constant so per-run discovery state lives on state, not the module.
     resourceNodes: RESOURCE_NODES.map((n, i) => ({ ...n, id: i, discoveredBy: {} })),
+    // ── Runtime catalogs (Phase 0) ── lifted from module constants so discovery
+    // can WRITE into them. recipeCatalog is seeded from the hidden TECH_GRAPH;
+    // materialCatalog from the base-material seed. Both are per-run and mutable.
+    // Read them via recipeFor(state, id) / state.materialCatalog[id], never the
+    // raw TECH_GRAPH constant, so minted recipes/materials are picked up too.
+    recipeCatalog: cloneRecipeCatalog(),
+    materialCatalog: buildMaterialCatalog(),
+    // normalized input+process keys that failed the physics gate — so the same
+    // dead-end idea isn't re-proposed every cooldown (Phase 1 dedup, seeded here).
+    rejectedCombos: {},
+    // running tally of discovery behavior (rates/health) for the panel + logs.
+    techMetrics: blankTechMetrics(),
     // village knowledge pool: { [techId]: { by, day } } — someone alive once knew it.
     knownTech: {},
     // chronicle of breakthroughs (for the Invention Log panel): { techId, label, by, day }
@@ -2076,6 +2143,8 @@ function processDiscovery(person, state) {
       addMemory(person, `Noticed ${node.look} near ${node.near}.`, 'discovery', state.day,
         { location: node.near, valence: 1 });
       person.thought = `Strange... ${node.look}.`;
+      simlog('resource.noticed', { person: person.name, day: state.day, material: node.material,
+        near: node.near }, `${person.name} noticed ${node.material} near ${node.near}`);
       setEmote(person, 'sparkle', 14);
     }
   }
@@ -2101,11 +2170,11 @@ function techPrereqsMet(person, state, tech) {
 
 // Map a free-text LLM idea onto a tech node, honoring what the person could
 // plausibly be reaching for. Returns the node or null (silent rejection).
-function matchIdeaToTech(ideaText) {
+function matchIdeaToTech(ideaText, state) {
   if (!ideaText) return null;
   const t = ideaText.toLowerCase();
   let best = null, bestHits = 0;
-  for (const tech of Object.values(TECH_GRAPH)) {
+  for (const tech of allRecipes(state)) {
     const hits = (tech.matches || []).filter(kw => t.includes(kw)).length;
     if (hits > bestHits) { bestHits = hits; best = tech; }
   }
@@ -2127,7 +2196,7 @@ function beginPrototype(person, state, tech) {
   if (!ok) {
     // turn the gap into the agent's next pursuit (Phase 2: missing piece = goal)
     if (missingKnowledge.length) {
-      const need = TECH_GRAPH[missingKnowledge[0]];
+      const need = recipeFor(state, missingKnowledge[0]);
       person.thought = `I can't make this yet — I need to figure out ${need?.label || missingKnowledge[0]} first.`;
     } else if (missingMaterials.length) {
       const mat = missingMaterials[0];
@@ -2145,6 +2214,8 @@ function beginPrototype(person, state, tech) {
   };
   person.activity = 'experimenting';
   setGoal(person, 'prototype', tech.label, 300);
+  simlog('discovery.prototype', { person: person.name, day: state.day, recipe: tech.id,
+    label: tech.label, attempts: tech.attemptsNeeded }, `${person.name} began prototyping ${tech.label}`);
   if (tech.group) {
     person.thought = `This is too much for one person — I should get someone to help dig.`;
     // recruit: seek the friendliest available adult to lend a hand
@@ -2177,7 +2248,7 @@ function recruitHelper(person, state) {
 function processPrototype(person, state) {
   const proto = person.prototype;
   if (!proto) return;
-  const tech = TECH_GRAPH[proto.techId];
+  const tech = recipeFor(state, proto.techId);
   if (!tech) { person.prototype = null; return; }
   person.activity = 'experimenting';
 
@@ -2215,6 +2286,7 @@ function processPrototype(person, state) {
   // before then, a lucky early breakthrough is possible but rare (~15%).
   const succeed = proto.attemptsLeft <= 0 ? (Math.random() > effFail) : (Math.random() > 0.85);
 
+  recordAttempt(state, succeed);
   if (!succeed) {
     // productive failure: burn a material, learn a little, leave a memory
     const mat = (tech.prereqMaterials || []).find(m => (person.inventory?.[m] || 0) > 0);
@@ -2227,6 +2299,8 @@ function processPrototype(person, state) {
     gainSkill(person, 'crafting', 0.1);
     setEmote(person, 'sweat', 10);
     rewardAction(person, 'invent', -0.5, state); // small sting, but they keep going
+    simlog('discovery.fail', { person: person.name, day: state.day, recipe: tech.id,
+      attemptsLeft: proto.attemptsLeft }, `${person.name} failed at ${tech.label}`);
     return;
   }
   techBreakthrough(person, state, tech);
@@ -2246,13 +2320,22 @@ function failureFlavor(tech) {
 // reward, reputation, role formalization, emote, chronicle entry.
 function techBreakthrough(person, state, tech) {
   person.prototype = null;
+  // already known to this person? don't re-celebrate a known craft — just clear
+  // the prototype and move on. Prevents re-prototyping a recipe from re-firing a
+  // full "breakthrough" (rewards, chronicle, logs) every time.
+  if (person.knownTech[tech.id]) { person.activity = 'idle'; return; }
   person.knownTech[tech.id] = true;
-  if (!state.knownTech[tech.id]) {
+  const firstForVillage = !state.knownTech[tech.id];
+  if (firstForVillage) {
     state.knownTech[tech.id] = { by: person.name, day: state.day };
     state.inventions.push({ techId: tech.id, label: tech.label, by: person.name, day: state.day });
     state.events.push({ day: state.day, hour: state.hour, participants: [person.name],
       summary: `💡 ${person.name} invented ${tech.label}!`, type: 'invention' });
   }
+  recordBreakthroughMetric(state, tech, tech.effect?.type);
+  simlog('discovery.breakthrough', { person: person.name, day: state.day, recipe: tech.id,
+    label: tech.label, effect: tech.effect, novel: tech.origin === 'derived', firstForVillage },
+    `💡 ${person.name} ${firstForVillage ? 'INVENTED' : 'replicated'} ${tech.label}`);
   // apply the payoff
   applyTechEffect(person, state, tech);
   // formalize a role (Phase 7)
@@ -2306,7 +2389,7 @@ function processTechObservation(person, state) {
     const theirTech = other.knownTech ? Object.keys(other.knownTech) : [];
     for (const techId of theirTech) {
       if (person.knownTech?.[techId]) continue;
-      const tech = TECH_GRAPH[techId];
+      const tech = recipeFor(state, techId);
       if (!tech || !attemptableTech(person, state, tech)) continue;
       // only "click" if they're plausibly demonstrating it (working/experimenting)
       if (!['experimenting', 'crafting', 'building', 'farming'].includes(other.activity)) continue;
@@ -2334,19 +2417,75 @@ export async function runIdeation(gameRef, personIdx, signal) {
     .map(info => `${info.look} (near ${info.near})`);
   if (!noticed.length) return; // nothing to ideate from
   const knownTechniques = Object.keys(person.knownTech || {})
-    .map(id => TECH_GRAPH[id]?.label).filter(Boolean);
+    .map(id => recipeFor(cs, id)?.label).filter(Boolean);
+  simlog('ideation.fire', { person: person.name, day: cs.day, model: person.model,
+    noticed: Object.keys(person.noticedResources || {}) }, `${person.name} is thinking up an idea...`);
   const result = await generateIdeation(person, { need, noticed, knownTechniques }, signal);
   recordModelResult(cs, person.model, !!result);
-  if (!result || !result.idea) return;
-  person.thought = result.idea;
-  const tech = matchIdeaToTech(result.idea + ' ' + (result.making || ''));
-  if (!tech) {
-    // silent rejection — they "can't quite figure it out" but it stews
-    addMemory(person, `Had an odd idea but couldn't make it work yet.`, 'experiment', cs.day, { valence: -0.2 });
-    person.thought = result.idea + ' ...but I can\'t make it work.';
+  if (!result || !result.idea) {
+    simlog('ideation.empty', { person: person.name, day: cs.day, model: person.model },
+      `${person.name}'s idea came back empty (model gave nothing usable)`);
     return;
   }
-  beginPrototype(person, cs, tech);
+  person.thought = result.idea;
+  simlog('ideation.result', { person: person.name, day: cs.day, idea: result.idea,
+    making: result.making, inputs: result.inputs, process: result.process },
+    `${person.name}: "${result.idea}"`);
+  // 1) known recipe? prototype it (the original, cheap, deterministic path).
+  const tech = matchIdeaToTech(result.idea + ' ' + (result.making || ''), cs);
+  if (tech) { beginPrototype(person, cs, tech); return; }
+
+  // 2) novel idea — try to DISCOVER something new. Run the LLM's structured
+  // intent through the physics gate; if it's allowed, mint a real recipe (and
+  // material) and prototype it. If the model gave no structured intent, fall
+  // back to the old "it stews" behavior.
+  const hypothesis = { inputs: result.inputs, process: result.process };
+  if (Array.isArray(hypothesis.inputs) && hypothesis.process) {
+    const verdict = physicsGate(hypothesis, cs, person);
+    recordGate(cs, verdict.ok, verdict.reason);
+    if (verdict.ok) {
+      // skip a dead-end we've already proven impossible (dedup, cheap)
+      if (cs.rejectedCombos?.[verdict.normalized.key]) { stewIdea(person, cs, result); return; }
+      simlog('discovery.gate.pass', { person: person.name, day: cs.day, process: hypothesis.process,
+        inputs: verdict.normalized.inputs }, `${person.name}: "${result.idea}"`);
+      // was there already a recipe for this exact combo? (re-discovery, not new)
+      const fresh = !Object.values(cs.recipeCatalog).some(r => r._mintedKey === verdict.normalized.key);
+      const minted = mintRecipe(verdict.normalized, cs, { label: cleanLabel(result.making) });
+      if (minted) {
+        if (fresh) {
+          recordMint(cs, minted, hypothesis.process, cs.day);
+          simlog('discovery.mint', { person: person.name, day: cs.day, recipe: minted.id,
+            label: minted.label, effect: minted.effect, attempts: minted.attemptsNeeded,
+            fail: Math.round(minted.failureChance * 100) / 100 },
+            `${person.name} conceived "${minted.label}"`);
+        }
+        person.thought = `${result.idea} — let me try.`;
+        beginPrototype(person, cs, minted);
+        return;
+      }
+    } else {
+      // physically impossible — remember the dead-end so we don't re-propose it
+      const key = `${[...new Set(hypothesis.inputs.map(s => String(s).toLowerCase()))].sort().join('+')}::${String(hypothesis.process).toLowerCase()}`;
+      cs.rejectedCombos = cs.rejectedCombos || {};
+      cs.rejectedCombos[key] = verdict.reason;
+      simlog('discovery.gate.reject', { person: person.name, day: cs.day, process: hypothesis.process,
+        inputs: hypothesis.inputs, reason: verdict.reason }, `${person.name}'s idea rejected: ${verdict.reason}`);
+    }
+  }
+  stewIdea(person, cs, result);
+}
+
+// The "couldn't quite figure it out" outcome — the idea stews as a faint memory.
+function stewIdea(person, state, result) {
+  addMemory(person, `Had an odd idea but couldn't make it work yet.`, 'experiment', state.day, { valence: -0.2 });
+  person.thought = result.idea + ' ...but I can\'t make it work.';
+}
+
+// Trim a model's free-text "making" into a short, clean material label.
+function cleanLabel(making) {
+  if (!making || typeof making !== 'string') return null;
+  const t = making.trim().replace(/^(a|an|the|some)\s+/i, '').slice(0, 40);
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : null;
 }
 
 function updateSkills(person, state) {
@@ -2531,7 +2670,7 @@ function processAdultTeaching(person, people, state) {
     if (distBetween(person, other) > 3) continue;
     // ── Phase 5: teach a RECIPE the novice lacks but could do (oral tradition) ──
     if (state && !person._pendingTechTeach && person.conversationCooldown <= 0) {
-      const teachable = myTech.find(t => !other.knownTech?.[t] && attemptableTech(other, state, TECH_GRAPH[t]));
+      const teachable = myTech.find(t => !other.knownTech?.[t] && attemptableTech(other, state, recipeFor(state, t)));
       if (teachable && Math.random() < 0.004) {
         person._pendingTechTeach = { student: other.name, techId: teachable };
         continue;
@@ -2635,7 +2774,9 @@ function processAmbitions(person, state) {
   if (!person.ambitions) return;
   for (const a of person.ambitions) {
     if (a.completed) continue;
-    if (a.check(person)) {
+    // `check` is a function lost across JSON save/load — rehydrated by migrateState,
+    // but guard anyway so a stray serialized ambition never crashes the tick.
+    if (typeof a.check === 'function' && a.check(person)) {
       a.completed = true;
       person.mood = 'excited';
       setEmote(person, 'sparkle', 40);
@@ -2683,6 +2824,9 @@ function processResources(state, dayRolled) {
   // spoilage: a fraction of each food type rots per game-day (a smokehouse can
   // slow this later via System 4)
   if (dayRolled) {
+    // daily discovery-metrics heartbeat — one line per game-day so the log shows
+    // rates over time (experiments/day, success rate, what's blocking ideas).
+    simlog('metrics', summarizeTech(state), `Day ${state.day} tech summary`);
     const buildingSlow = (state.buildings || []).some(b => /smokehouse|storage|drying/i.test(b.type || '')) ? 0.5 : 1;
     // invented preservation tech (pottery/drying rack/smokehouse) compounds with
     // any storage building, via the spoilageMult set in applyTechEffect.
@@ -2866,9 +3010,11 @@ function killPerson(person, state, cause) {
     const stillKnown = alivePeople.some(p => p.knownTech?.[techId]);
     if (!stillKnown && state.knownTech[techId]) {
       delete state.knownTech[techId];
-      const tech = TECH_GRAPH[techId];
+      const tech = recipeFor(state, techId);
       state.events.push({ day: state.day, hour: state.hour, participants: [person.name],
         summary: `📜 The secret of ${tech?.label || techId} died with ${person.name}.`, type: 'knowledge_lost' });
+      simlog('tech.forgotten', { day: state.day, recipe: techId, label: tech?.label,
+        person: person.name }, `📜 ${tech?.label || techId} forgotten — died with ${person.name}`);
       // drop the village-wide tech effect that depended on it
       recomputeTechEffects(state);
     }
@@ -2925,7 +3071,7 @@ function recomputeTechEffects(state) {
   state.spoilageMult = 1;
   state.farmYieldMult = 1;
   for (const techId of Object.keys(state.knownTech || {})) {
-    const tech = TECH_GRAPH[techId];
+    const tech = recipeFor(state, techId);
     if (!tech) continue;
     const e = tech.effect || {};
     if (e.type === 'storage') state.spoilageMult = Math.min(state.spoilageMult, 1 - (e.food || 0));
@@ -3535,7 +3681,7 @@ export async function runConversation(gameRef, participantIndices, onUpdate, sig
     if (!signal?.aborted && speaker._pendingTechTeach) {
       const student = others.find(o => o.name === speaker._pendingTechTeach.student);
       const techId = speaker._pendingTechTeach.techId;
-      const tech = TECH_GRAPH[techId];
+      const tech = recipeFor(gameRef.current, techId);
       speaker._pendingTechTeach = null;
       if (student && tech && !student.knownTech?.[techId]) {
         const t = await generateTeaching(speaker, student, tech.label, signal);

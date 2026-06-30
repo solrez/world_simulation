@@ -599,6 +599,12 @@
 .section-label .close-x { float: right; cursor: pointer; opacity: 0.5; }
 .section-label .close-x:hover { opacity: 1; color: #c08080; }
 
+/* Tech metrics (Phase 4) */
+.tech-metrics .metric-row { display: flex; justify-content: space-between; font-size: 12px; padding: 1px 0; }
+.tech-metrics .metric-row span:first-child { opacity: 0.65; }
+.tech-metrics .metric-row span:last-child { color: #9bb0d0; }
+.tech-metrics .metric-note { font-size: 11px; opacity: 0.5; margin-top: 3px; }
+
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: #0a0f0a; }

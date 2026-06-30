@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node src/engine/tech/physics.test.mjs && node src/engine/tech/derive.test.mjs && node src/engine/tech/discovery.test.mjs"
   },
   "dependencies": {
     "pixi.js": "^8.19.0",

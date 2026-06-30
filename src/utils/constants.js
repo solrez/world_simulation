@@ -405,6 +405,52 @@ export const TECH_GRAPH = {
 // wood/stone/thatch. Tracked per-agent in `inventory`.
 export const TECH_MATERIALS = ['clay', 'copper', 'flint', 'coal', 'charcoal', 'copper_ingot'];
 
+// ── Schema version (Phase 0) ──
+// Bumped whenever the shape of saved world_state changes. `migrateState()` reads
+// this on load to upgrade old saves rather than break on them. v1 = the first
+// version that carries runtime catalogs (recipeCatalog / materialCatalog).
+export const SCHEMA_VERSION = 1;
+
+// ── Material catalog seed (Phase 0) ──
+// The base materials the world starts knowing about. Every material the sim ever
+// reasons over — base or later DERIVED by discovery — lives in one catalog with a
+// uniform shape, so the physics gate and material derivation (later phases) have
+// real properties to read and combine. The LLM never writes these numbers; they
+// are the deterministic ground truth that derived materials inherit from.
+//
+// Fields:
+//   id, label   — internal id + display name
+//   tags        — coarse qualities used by the gate / derivation (e.g. 'mineral', 'fired')
+//   origin      — 'base' (seeded here) | 'derived' (minted at runtime)
+//   mass        — coarse "amount of stuff" for the conservation bound (no free matter)
+//   durability  — how well it survives use/work (0..1)
+//   energyCost  — relative effort to obtain/produce (drives difficulty & cost)
+//   rarity      — 0 (everywhere) .. 1 (scarce); seeds derived rarity & difficulty
+const baseMaterial = (id, label, tags, props) => ({
+  id, label, tags, origin: 'base', version: SCHEMA_VERSION,
+  mass: 1, durability: 0.5, energyCost: 1, rarity: 0.3, ...props,
+});
+export const BASE_MATERIALS = [
+  baseMaterial('wood',        'Wood',         ['organic', 'fuel'],            { mass: 1,   durability: 0.4, energyCost: 1,   rarity: 0.1 }),
+  baseMaterial('stone',       'Stone',        ['mineral'],                    { mass: 2,   durability: 0.8, energyCost: 1.5, rarity: 0.2 }),
+  baseMaterial('thatch',      'Thatch',       ['organic'],                    { mass: 0.3, durability: 0.2, energyCost: 0.8, rarity: 0.1 }),
+  baseMaterial('clay',        'Clay',         ['mineral', 'raw', 'soft'],     { mass: 1,   durability: 0.2, energyCost: 1,   rarity: 0.3 }),
+  baseMaterial('copper',      'Copper Ore',   ['mineral', 'raw', 'metal'],    { mass: 2,   durability: 0.5, energyCost: 2,   rarity: 0.5 }),
+  baseMaterial('flint',       'Flint',        ['mineral', 'sharp'],           { mass: 1,   durability: 0.7, energyCost: 1.2, rarity: 0.4 }),
+  baseMaterial('coal',        'Coal',         ['mineral', 'fuel'],            { mass: 1,   durability: 0.3, energyCost: 1.5, rarity: 0.5 }),
+  baseMaterial('charcoal',    'Charcoal',     ['fuel', 'fired'],              { mass: 0.6, durability: 0.3, energyCost: 2,   rarity: 0.4 }),
+  baseMaterial('copper_ingot','Copper Ingot', ['metal', 'worked', 'fired'],  { mass: 1.8, durability: 0.8, energyCost: 4,   rarity: 0.6 }),
+];
+
+// Build the runtime material catalog ({ [id]: material }) from the seed. Called
+// once per run by createSimulation; the result lives on state and is mutable, so
+// discovery can register new materials into it.
+export function buildMaterialCatalog() {
+  const cat = {};
+  for (const m of BASE_MATERIALS) cat[m.id] = { ...m, tags: [...m.tags] };
+  return cat;
+}
+
 // Roles a villager can formalize into when they invent the right thing (Phase 7).
 export const TECH_ROLES = { potter: 'potter', smith: 'smith' };
 

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { SidePanel } from './SidePanel.jsx';
-import { InventionLog, VillageKnowledge, ResourceInspector } from './InventionPanels.jsx';
+import { InventionLog, VillageKnowledge, ResourceInspector, TechMetrics } from './InventionPanels.jsx';
 import { GodPowers } from './GodPowers.jsx';
 
 // The whole right column is now a single tabbed panel so each view gets the full
@@ -70,8 +70,9 @@ export function RightPanel(props) {
                 onClose={onClearTile}
               />
             )}
+            <TechMetrics metrics={game.techMetrics} materialCatalog={game.materialCatalog} />
             <InventionLog inventions={game.inventions} knownTech={game.knownTech} />
-            <VillageKnowledge knownTech={game.knownTech} people={people} />
+            <VillageKnowledge knownTech={game.knownTech} people={people} recipeCatalog={game.recipeCatalog} />
             {!inspectedTile && (
               <div className="panel-section">
                 <div className="section-label">🔍 Inspect</div>

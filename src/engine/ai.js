@@ -469,14 +469,20 @@ Is there something you could TRY making or doing with these — some experiment
 that might make your life easier? Don't worry about whether it'll work. Describe
 it the way YOU would, in plain words, as something you want to attempt.
 
+Pick ONE simple action word for how you'd do it — one of: heat, grind, mix, dry,
+soak, strike, bury, ferment, carve, weave. Name the few things (one to four) you'd
+use, in your own words.
+
 JSON:
 {
   "idea": "one or two sentences, first person, what you want to try (e.g. 'I wonder if those green rocks would melt if I got the fire hot enough')",
   "making": "a few words naming the thing you're trying to make or do",
+  "inputs": ["the materials you'd use, named the way you'd say them (e.g. 'the grey sticky earth')"],
+  "process": "one action word from the list above",
   "feeling": "your mood about it"
 }`;
 
-  const result = await callLLM(systemPrompt, userPrompt, 1.0, 250, 'ideation', signal, person.model);
+  const result = await callLLM(systemPrompt, userPrompt, 1.0, 280, 'ideation', signal, person.model);
   if (!result || typeof result.idea !== 'string' || !result.idea.trim()) return null;
   return result;
 }

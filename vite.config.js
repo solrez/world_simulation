@@ -4,6 +4,7 @@ import fs from 'fs'
 import path from 'path'
 
 const dataDir = path.resolve(__dirname, 'data');
+const logsDir = path.resolve(__dirname, 'logs');
 
 // plugin that adds API endpoints for saving conversation data to disk
 function saveDataPlugin() {
@@ -30,6 +31,29 @@ function saveDataPlugin() {
             fs.appendFileSync(file, JSON.stringify(record) + '\n');
             res.setHeader('Content-Type', 'application/json');
             res.end(JSON.stringify({ ok: true }));
+          } catch (e) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: e.message }));
+          }
+        });
+      });
+
+      // POST /api/log — append a batch of structured debug-log records (one JSON
+      // array) to logs/sim.jsonl, one record per line. Used by the sim's debug
+      // logger to leave a follow-along trace of discovery / tech events on disk.
+      server.middlewares.use('/api/log', (req, res) => {
+        if (req.method !== 'POST') { res.statusCode = 405; res.end(); return; }
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+          try {
+            const records = JSON.parse(body);
+            const list = Array.isArray(records) ? records : [records];
+            fs.mkdirSync(logsDir, { recursive: true });
+            const lines = list.map(r => JSON.stringify(r)).join('\n');
+            if (lines) fs.appendFileSync(path.join(logsDir, 'sim.jsonl'), lines + '\n');
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ ok: true, n: list.length }));
           } catch (e) {
             res.statusCode = 500;
             res.end(JSON.stringify({ error: e.message }));
