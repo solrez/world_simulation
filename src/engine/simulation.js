@@ -1,4 +1,4 @@
-import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, REPUTATION_DIMS, REPUTATION_DECAY_PER_DAY, GOSSIP_PULL, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN, SCHEMA_VERSION, buildMaterialCatalog } from '../utils/constants.js';
+import { PERSONALITIES, LOCATIONS, MAP_W, MAP_H, TERRAIN, RELATIONSHIP_STAGES, LIFE_STAGES, MOOD_LOCATIONS, CHILD_NAMES, AMBIENT_EVENTS, WILDLIFE_TYPES, GATE, YEARS_PER_DAY, TICKS_PER_DAY, GESTATION_DAYS, CONCEPTION_CHANCE, FOOD_TYPES, Q_ALPHA, Q_EPSILON, SEASON_ABUNDANCE, FARM, GOSSIP_CHANCE, FRAILTY_START_AGE, FRAILTY_PER_DAY, HEALTH_REGEN_PER_DAY, INJURY_HEAL_PER_DAY, HEALER_HEAL_BONUS, FRAILTY_SPEED_PENALTY, INJURY_SPEED_PENALTY, RESOURCE_NODES, DISCOVERY, IDEA, TECH_GRAPH, PROTOTYPE, WILDLIFE_TARGETS, WILDLIFE_RESPAWN, SCHEMA_VERSION, buildMaterialCatalog } from '../utils/constants.js';
 import { nearestWalkable } from './pathfinding.js';
 import { clearCompletedGoal } from './goals.js';
 import { nearestVisiblePrey, perceive } from './vision.js';
@@ -11,6 +11,7 @@ import { getTimeOfDay, personTimeOfDay, distBetween, locationAt, clamp, getWalka
 import { addMemory, decayMemories, personValence, weightedLocationPick, setEmote } from './memory.js';
 import { chronotypeFor, recordModelResult, reassignFlakyModels, pickModelWeighted } from './models.js';
 import { addFood, totalFood, eatFood, takeFromLarder, patchYield, depletePatch, depleteGrove, regrowPatches, updatePond, growField, fieldReady } from './food.js';
+import { blankReputation, bumpReputation, decayReputation, pickGossipTarget, applyGossip, reputationLabel } from './reputation.js';
 
 // ── Conversation Archive (persisted to localStorage) ──
 
@@ -344,13 +345,6 @@ function canBeAttracted(a, b) {
 }
 
 // ── State ──
-
-// A blank reputation record (all dimensions neutral at 0).
-function blankReputation() {
-  const r = {};
-  for (const d of REPUTATION_DIMS) r[d] = 0;
-  return r;
-}
 
 // ── Catalog access (Phase 0) ──
 // A deep-ish clone of the hidden TECH_GRAPH seed into a mutable per-run catalog.
@@ -1688,67 +1682,6 @@ function gainSkill(person, skill, amount = SKILL_GAIN_ON_SUCCESS) {
 }
 
 // ── Typed food economy ──
-// ── Reputation ──
-// Nudge the village's collective read on `name` along one dimension, and slowly
-// decay everyone's standing toward neutral so reputations must be re-earned.
-function bumpReputation(state, name, dim, delta) {
-  if (!state.reputation) state.reputation = {};
-  const r = state.reputation[name] || (state.reputation[name] = blankReputation());
-  if (r[dim] == null) r[dim] = 0;
-  r[dim] = clamp(r[dim] + delta, -100, 100);
-}
-function decayReputation(state) {
-  if (!state.reputation) return;
-  for (const rec of Object.values(state.reputation))
-    for (const d of REPUTATION_DIMS) rec[d] = (rec[d] || 0) * REPUTATION_DECAY_PER_DAY;
-}
-// Choose a juicy absent third party to gossip about: someone the speaker has a
-// relationship with who ISN'T in the current conversation. Prefers people the
-// speaker feels strongly about (high or low affection) — those make better talk.
-function pickGossipTarget(speaker, present, allPeople) {
-  const presentNames = new Set([speaker.name, ...present.map(p => p.name)]);
-  const candidates = allPeople.filter(p => p.alive !== false && !presentNames.has(p.name) && speaker.relationships?.[p.name]?.familiarity > 10);
-  if (!candidates.length) return null;
-  candidates.sort((a, b) => {
-    const ra = speaker.relationships[a.name], rb = speaker.relationships[b.name];
-    return Math.abs((rb.affection ?? 50) - 50) - Math.abs((ra.affection ?? 50) - 50);
-  });
-  // mostly the most-salient, sometimes a random other for variety
-  return Math.random() < 0.7 ? candidates[0] : candidates[Math.floor(Math.random() * candidates.length)];
-}
-
-// A listener hearing gossip nudges their private belief about the absent person
-// toward the speaker's lean — this is how reputation travels third-hand.
-function applyGossip(speaker, listeners, absentName, sign, state) {
-  if (!sign) return;
-  const villageRep = (state.reputation || {})[absentName] || blankReputation();
-  for (const listener of listeners) {
-    if (!listener.reputationBeliefs) listener.reputationBeliefs = {};
-    const belief = listener.reputationBeliefs[absentName] || (listener.reputationBeliefs[absentName] = { ...villageRep });
-    // pull the belief toward a generally-good or generally-bad read
-    for (const d of REPUTATION_DIMS) {
-      const target = sign * 30;
-      belief[d] = clamp((belief[d] || 0) + (target - (belief[d] || 0)) * GOSSIP_PULL, -100, 100);
-    }
-    // trusting the speaker, the listener's own affection drifts slightly too
-    const lr = listener.relationships?.[absentName];
-    if (lr) lr.affection = clamp(lr.affection + sign * 1.5, 0, 100);
-  }
-}
-
-// The single word the village most associates with someone (for prompts), or null.
-function reputationLabel(state, name) {
-  const r = state.reputation?.[name];
-  if (!r) return null;
-  let best = null, mag = 12; // needs a real reputation to surface
-  for (const d of REPUTATION_DIMS) {
-    if (Math.abs(r[d]) > mag) { mag = Math.abs(r[d]); best = { dim: d, val: r[d] }; }
-  }
-  if (!best) return null;
-  const POS = { generous: 'generous', kind: 'kind', skilled: 'highly skilled', reliable: 'dependable', brave: 'brave' };
-  const NEG = { generous: 'selfish', kind: 'cold', skilled: 'unskilled', reliable: 'unreliable', brave: 'timid' };
-  return best.val > 0 ? POS[best.dim] : NEG[best.dim];
-}
 
 // ── Q-learning-lite: agents learn which actions pay off, per season ──
 // Coarse context keeps the table tiny so it learns fast and stays inspectable.
